@@ -2,6 +2,8 @@
 // as a resource. C# 5 / .NET Framework 4.x, compiled with the csc.exe that ships with Windows.
 using System;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
 using System.Drawing;
 using System.IO;
 using System.IO.Compression;
@@ -15,10 +17,16 @@ namespace PeralnaSetup
     static class Product
     {
         public const string Name = "Автоперална Павлинка";
-        public const string Version = "1.0.0";
+        public const string Version = "1.0.1";
         public const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\AvtoperalnaPavlinka";
         public const string FirewallRule = "Avtoperalna Pavlinka - PLC Modbus 502";
         public const string AdminUrl = "http://localhost:8080/";
+
+        public static string Menu { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms), Name); } }
+        public static string Desktop { get { return Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory); } }
+        public static string StartupLink { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup), Name + " — агент.lnk"); } }
+        public static string AgentLinkName { get { return Name + " — агент.lnk"; } }
+        public static string AdminLinkName { get { return Name + " — админ панел.url"; } }
     }
 
     class SetupForm : Form
@@ -136,20 +144,18 @@ namespace PeralnaSetup
 
                 Step("Правам икони…", 75);
                 string agent = Path.Combine(dir, "PeralnaAgent.exe");
-                string startup = Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup);
-                string desk = Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory);
-                string menu = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms), Product.Name);
-                Directory.CreateDirectory(menu);
-                Shortcut(Path.Combine(menu, Product.Name + " — агент.lnk"), agent, dir, 1);
-                UrlShortcut(Path.Combine(menu, Product.Name + " — админ панел.url"), Product.AdminUrl, agent);
-                Shortcut(Path.Combine(menu, "Деинсталирај.lnk"), Path.Combine(dir, "uninstall.bat"), dir, 1);
-                string startupLink = Path.Combine(startup, Product.Name + " — агент.lnk");
-                if (autoStart.Checked) Shortcut(startupLink, agent, dir, 7);
-                else if (File.Exists(startupLink)) File.Delete(startupLink);
+                string uninstaller = Path.Combine(dir, "uninstall.exe");
+                File.Copy(Application.ExecutablePath, uninstaller, true);
+                Directory.CreateDirectory(Product.Menu);
+                Shortcut(Path.Combine(Product.Menu, Product.AgentLinkName), agent, "", dir, agent, 1);
+                UrlShortcut(Path.Combine(Product.Menu, Product.AdminLinkName), Product.AdminUrl, agent);
+                Shortcut(Path.Combine(Product.Menu, "Деинсталирај.lnk"), uninstaller, "/uninstall", dir, agent, 1);
+                if (autoStart.Checked) Shortcut(Product.StartupLink, agent, "", dir, agent, 7);
+                else if (File.Exists(Product.StartupLink)) File.Delete(Product.StartupLink);
                 if (desktop.Checked)
                 {
-                    Shortcut(Path.Combine(desk, Product.Name + " — агент.lnk"), agent, dir, 1);
-                    UrlShortcut(Path.Combine(desk, Product.Name + " — админ панел.url"), Product.AdminUrl, agent);
+                    Shortcut(Path.Combine(Product.Desktop, Product.AgentLinkName), agent, "", dir, agent, 1);
+                    UrlShortcut(Path.Combine(Product.Desktop, Product.AdminLinkName), Product.AdminUrl, agent);
                 }
 
                 if (firewall.Checked)
@@ -160,7 +166,7 @@ namespace PeralnaSetup
                 }
 
                 Step("Регистрирам ја програмата…", 92);
-                WriteUninstaller(dir, startupLink, desk, menu);
+                File.Delete(Path.Combine(dir, "uninstall.bat"));   // left over from 1.0.0
                 using (RegistryKey k = Registry.LocalMachine.CreateSubKey(Product.UninstallKey))
                 {
                     k.SetValue("DisplayName", Product.Name);
@@ -168,7 +174,7 @@ namespace PeralnaSetup
                     k.SetValue("Publisher", Product.Name);
                     k.SetValue("InstallLocation", dir);
                     k.SetValue("DisplayIcon", agent);
-                    k.SetValue("UninstallString", "\"" + Path.Combine(dir, "uninstall.bat") + "\"");
+                    k.SetValue("UninstallString", "\"" + uninstaller + "\" /uninstall");
                     k.SetValue("NoModify", 1, RegistryValueKind.DWord);
                     k.SetValue("NoRepair", 1, RegistryValueKind.DWord);
                 }
@@ -196,7 +202,7 @@ namespace PeralnaSetup
             }
         }
 
-        static void StopRunning(string dir)
+        public static void StopRunning(string dir)
         {
             string root = Path.GetFullPath(dir).TrimEnd('\\') + "\\";
             foreach (string name in new[] { "PeralnaAgent", "php" })
@@ -249,16 +255,17 @@ namespace PeralnaSetup
             }
         }
 
-        static void Shortcut(string path, string target, string workDir, int windowStyle)
+        // IShellLinkW keeps the Cyrillic file names; WScript.Shell turned them into "????".
+        static void Shortcut(string path, string target, string args, string workDir, string icon, int showCmd)
         {
-            Type shellType = Type.GetTypeFromProgID("WScript.Shell");
-            dynamic shell = Activator.CreateInstance(shellType);
-            dynamic link = shell.CreateShortcut(path);
-            link.TargetPath = target;
-            link.WorkingDirectory = workDir;
-            link.WindowStyle = windowStyle;
-            link.IconLocation = Path.Combine(workDir, "PeralnaAgent.exe") + ",0";
-            link.Save();
+            IShellLinkW link = (IShellLinkW)new ShellLink();
+            link.SetPath(target);
+            link.SetArguments(args);
+            link.SetWorkingDirectory(workDir);
+            link.SetIconLocation(icon, 0);
+            link.SetShowCmd(showCmd);
+            ((IPersistFile)link).Save(path, true);
+            Marshal.ReleaseComObject(link);
         }
 
         static void UrlShortcut(string path, string url, string iconFile)
@@ -266,46 +273,91 @@ namespace PeralnaSetup
             File.WriteAllText(path, "[InternetShortcut]\r\nURL=" + url + "\r\nIconFile=" + iconFile + "\r\nIconIndex=0\r\n", Encoding.Default);
         }
 
-        static void Run(string exe, string args)
+        public static void Run(string exe, string args)
         {
             ProcessStartInfo psi = new ProcessStartInfo(exe, args);
             psi.CreateNoWindow = true;
             psi.UseShellExecute = false;
             using (Process p = Process.Start(psi)) p.WaitForExit(15000);
         }
+    }
 
-        static void WriteUninstaller(string dir, string startupLink, string desk, string menu)
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+    class ShellLink { }
+
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("000214F9-0000-0000-C000-000000000046")]
+    interface IShellLinkW
+    {
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder file, int cch, IntPtr fd, uint flags);
+        void GetIDList(out IntPtr pidl);
+        void SetIDList(IntPtr pidl);
+        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder name, int cch);
+        void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string name);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder dir, int cch);
+        void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string dir);
+        void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder args, int cch);
+        void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string args);
+        void GetHotkey(out short hotkey);
+        void SetHotkey(short hotkey);
+        void GetShowCmd(out int showCmd);
+        void SetShowCmd(int showCmd);
+        void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int cch, out int index);
+        void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string path, int index);
+        void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string path, uint reserved);
+        void Resolve(IntPtr hwnd, uint flags);
+        void SetPath([MarshalAs(UnmanagedType.LPWStr)] string file);
+    }
+
+    // uninstall.exe /uninstall (a copy of Setup.exe in the install folder).
+    // Removes the program, shortcuts, firewall rule and registry entry; keeps data\ and agent.ini.
+    static class Uninstaller
+    {
+        public static void Run()
         {
-            StringBuilder b = new StringBuilder();
-            b.AppendLine("@echo off");
-            b.AppendLine("chcp 65001 >nul");
-            b.AppendLine("net session >nul 2>&1 || (powershell -Command \"Start-Process '%~f0' -Verb RunAs\" & exit /b)");
-            b.AppendLine("echo Деинсталирање на " + Product.Name + ". Базата (data\\peralna.sqlite) останува.");
-            b.AppendLine("pause");
-            b.AppendLine("taskkill /F /IM PeralnaAgent.exe >nul 2>&1");
-            b.AppendLine("powershell -NoProfile -Command \"Get-Process php -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '" + dir + "\\*' } | Stop-Process -Force\"");
-            b.AppendLine("netsh advfirewall firewall delete rule name=\"" + Product.FirewallRule + "\" >nul 2>&1");
-            b.AppendLine("del \"" + startupLink + "\" >nul 2>&1");
-            b.AppendLine("del \"" + Path.Combine(desk, Product.Name + " — агент.lnk") + "\" >nul 2>&1");
-            b.AppendLine("del \"" + Path.Combine(desk, Product.Name + " — админ панел.url") + "\" >nul 2>&1");
-            b.AppendLine("rmdir /S /Q \"" + menu + "\" >nul 2>&1");
-            b.AppendLine("reg delete \"HKLM\\" + Product.UninstallKey + "\" /f >nul 2>&1");
+            string dir = Path.GetDirectoryName(Application.ExecutablePath);
+            if (MessageBox.Show("Да се отстрани " + Product.Name + "?\n\nБазата со картичките (data\\peralna.sqlite) и agent.ini остануваат во\n" + dir,
+                    Product.Name, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+
+            SetupForm.StopRunning(dir);
+            SetupForm.Run("netsh", "advfirewall firewall delete rule name=\"" + Product.FirewallRule + "\"");
+            foreach (string f in new[] {
+                Product.StartupLink,
+                Path.Combine(Product.Desktop, Product.AgentLinkName),
+                Path.Combine(Product.Desktop, Product.AdminLinkName) })
+                TryDelete(f);
+            try { if (Directory.Exists(Product.Menu)) Directory.Delete(Product.Menu, true); } catch { }
+            try { Registry.LocalMachine.DeleteSubKeyTree(Product.UninstallKey, false); } catch { }
             foreach (string sub in new[] { "php", "www", "app", "plc" })
-                b.AppendLine("rmdir /S /Q \"" + Path.Combine(dir, sub) + "\" >nul 2>&1");
-            b.AppendLine("del \"" + Path.Combine(dir, "PeralnaAgent.exe") + "\" \"" + Path.Combine(dir, "README.md") + "\" >nul 2>&1");
-            b.AppendLine("echo Готово. Во " + dir + " останаа data\\ и agent.ini.");
-            b.AppendLine("pause");
-            b.AppendLine("(goto) 2>nul & del \"%~f0\"");
-            File.WriteAllText(Path.Combine(dir, "uninstall.bat"), b.ToString(), new UTF8Encoding(false));
+                try { if (Directory.Exists(Path.Combine(dir, sub))) Directory.Delete(Path.Combine(dir, sub), true); } catch { }
+            foreach (string f in new[] { "PeralnaAgent.exe", "README.md", "uninstall.bat" })
+                TryDelete(Path.Combine(dir, f));
+
+            // This exe cannot delete itself while it runs: cmd removes it a moment later.
+            ProcessStartInfo psi = new ProcessStartInfo("cmd.exe", "/c ping 127.0.0.1 -n 3 >nul & del /f /q \"" + Application.ExecutablePath + "\"");
+            psi.CreateNoWindow = true;
+            psi.UseShellExecute = false;
+            Process.Start(psi);
+            MessageBox.Show(Product.Name + " е отстранета.\n\nПодатоците останаа во " + Path.Combine(dir, "data"), Product.Name,
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        static void TryDelete(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); } catch { }
         }
     }
 
     static class Program
     {
         [STAThread]
-        static void Main()
+        static void Main(string[] args)
         {
             Application.EnableVisualStyles();
+            if (args.Length > 0 && args[0].Equals("/uninstall", StringComparison.OrdinalIgnoreCase))
+            {
+                Uninstaller.Run();
+                return;
+            }
             Application.Run(new SetupForm());
         }
     }
