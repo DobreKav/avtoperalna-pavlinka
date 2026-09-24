@@ -16,7 +16,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 
 $machines = db()->query(
-    "SELECT m.*, s.id AS session_id, s.started_at, s.last_seen_at, s.charged, c.id AS card_id, c.uid, c.holder_name, c.balance
+    "SELECT m.*, s.id AS session_id, s.started_at, s.last_seen_at, s.charged, s.active_since, c.id AS card_id, c.uid, c.holder_name, c.balance
      FROM machines m
      LEFT JOIN sessions s ON s.machine_id = m.id AND s.status = 'running'
      LEFT JOIN cards c ON c.id = s.card_id
@@ -94,6 +94,7 @@ page_header('Машини', $user, true);
     <?php if ($running): ?>
       <dl>
         <dt>Картичка</dt><dd><a href="card.php?id=<?= (int)$m['card_id'] ?>"><?= e($m['holder_name'] ?: $m['uid']) ?></a></dd>
+        <dt>Состојба</dt><dd><?= $m['active_since'] !== null ? '💧 Тече · се наплаќа' : '⏸ СТОП · не се наплаќа' ?></dd>
         <dt>Време</dt><dd><?= duration(time() - utc_ts($m['started_at'])) ?></dd>
         <dt>Наплатено</dt><dd><?= money((int)$m['charged']) ?></dd>
         <dt>Салдо</dt><dd><?= money((int)$m['balance']) ?> · уште ~<?= duration(seconds_left((int)$m['balance'], (int)$m['price_per_minute'])) ?></dd>

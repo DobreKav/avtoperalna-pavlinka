@@ -50,7 +50,8 @@ try {
         case 'start':
             reply(begin_machine_session((string)($input['machine'] ?? ''), (string)($input['uid'] ?? '')));
         case 'tick':
-            reply(tick_machine_session((int)($input['session_id'] ?? 0)));
+            $active = isset($input['active']) ? $input['active'] === '1' : null;
+            reply(tick_machine_session((int)($input['session_id'] ?? 0), $active));
         case 'stop':
             reply(finish_machine_session((int)($input['session_id'] ?? 0), 'removed', 'api'));
         default:

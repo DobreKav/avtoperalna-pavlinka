@@ -25,7 +25,9 @@ function check(string $label, $actual, $expected): void
 // Pretend the session began $seconds ago (and was last seen $seenAgo ago).
 function age_session(int $id, int $seconds, ?int $seenAgo = null): void
 {
-    db()->prepare('UPDATE sessions SET started_at = ?, last_seen_at = ? WHERE id = ?')->execute([
+    // Spraying (foam or water) the whole time since the start.
+    db()->prepare('UPDATE sessions SET started_at = ?, active_since = ?, active_seconds = 0, last_seen_at = ? WHERE id = ?')->execute([
+        gmdate('Y-m-d H:i:s', time() - $seconds),
         gmdate('Y-m-d H:i:s', time() - $seconds),
         gmdate('Y-m-d H:i:s', time() - ($seenAgo ?? $seconds)),
         $id,
@@ -108,6 +110,22 @@ $s5 = begin_machine_session('D1', '04A1B2C3');
 $old = db()->query('SELECT status, end_reason FROM sessions WHERE id = ' . (int)$s4['session_id'])->fetch();
 check('previous card session ended', $old['end_reason'], 'removed');
 check('new card runs', $s5['running'], true);
+
+// СТОП: nothing is charged while paused; foam/water resumes billing.
+$p = begin_machine_session('W2', '04A1B2C3');
+check('new session starts paused', $p['active'], false);
+db()->prepare('UPDATE sessions SET started_at = ? WHERE id = ?')->execute([gmdate('Y-m-d H:i:s', time() - 600), $p['session_id']]);
+$t = tick_machine_session($p['session_id']);
+check('10 min in the reader without foam/water costs nothing', $t['charged'], 0);
+tick_machine_session($p['session_id'], true);
+db()->prepare('UPDATE sessions SET active_since = ? WHERE id = ?')->execute([gmdate('Y-m-d H:i:s', time() - 120), $p['session_id']]);
+$t = tick_machine_session($p['session_id'], false); // СТОП after 2 min of water
+check('2 min spraying at 5/min = 10 den, then paused', [$t['charged'], $t['active']], [10, false]);
+db()->prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ?')->execute([gmdate('Y-m-d H:i:s', time()), $p['session_id']]);
+$t = tick_machine_session($p['session_id']);
+check('still 10 den while paused', $t['charged'], 10);
+$done = finish_machine_session($p['session_id'], 'removed', 'api');
+check('card out after the pause: 10 den in total', $done['charged'], 10);
 
 // Demo card: exists after setup and refills itself when low.
 $demo = find_card_by_uid(DEMO_UID);

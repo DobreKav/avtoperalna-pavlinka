@@ -9,7 +9,9 @@
 //   4  status          see Status below
 //   5  heartbeat       +1 every second; if it stops changing, the PLC must stop the machine
 //   6  minutes left
-//   10-19              free for the PLC to write (FC6/FC16), e.g. machine feedback
+//   10 program         written by the PLC (FC6/FC16): 0 stop, 1 foam, 2 water. The card is billed
+//                      only while this is 1 or 2, so СТОП on the bay stops the money running out.
+//   11-19              free for the PLC to write
 //   20 name length     card holder name for the touch panel, in characters (max 32)
 //   21-52 name         one UTF-16 character per register (Cyrillic works; WString on the PLC)
 using System;
@@ -547,6 +549,7 @@ namespace Peralna
         readonly Queue<string> commands = new Queue<string>();
         string simulatedUid;
         bool simActive;     // the card came from the virtual reader (CardEmulator.exe)
+        bool spraying;      // last state sent to the server: foam or water on
         readonly VirtualReader virtualReader = new VirtualReader();
 
         public Agent(Config cfg) { this.cfg = cfg; api = new Api(cfg); }
@@ -757,6 +760,7 @@ namespace Peralna
             if (Bool(r, "running"))
             {
                 sessionId = Int(r, "session_id");
+                spraying = Bool(r, "active");
                 lastTick = DateTime.Now;
                 Show(Status.Running, true);
                 Log.Write("Machine ON  session " + sessionId + ", balance " + Int(r, "balance") + ", ~" + (secondsLeft / 60) + " min");
@@ -779,6 +783,7 @@ namespace Peralna
             regs.Set(1, 0);
             regs.Set(6, 0);
             SetName("");
+            spraying = false;
             Log.Write("Card out");
             if (sessionId != 0)
             {
@@ -832,16 +837,24 @@ namespace Peralna
             if (pendingStops.Count > 0) FlushStops();
             if (sessionId == 0) return;
 
-            secondsLeft = Math.Max(0, secondsLeft - 1);
-            regs.Set(1, secondsLeft);
-            regs.Set(6, secondsLeft / 60);
-            bool due = (DateTime.Now - lastTick).TotalSeconds >= cfg.TickSeconds || secondsLeft == 0;
-            if (secondsLeft == 0) regs.Set(0, 0); // out of money by our own count: stop now, the server confirms
+            // Foam or water is on: the PLC writes its program to register 10. A stale value from a
+            // PLC that has gone away does not count.
+            bool nowSpraying = regs.Get(0) == 1 && regs.Get(10) != 0 && ModbusServer.PlcConnected();
+            bool changed = nowSpraying != spraying;
+            if (nowSpraying)
+            {
+                secondsLeft = Math.Max(0, secondsLeft - 1);
+                regs.Set(1, secondsLeft);
+                regs.Set(6, secondsLeft / 60);
+                if (secondsLeft == 0) regs.Set(0, 0); // out of money by our own count: stop now, the server confirms
+            }
+            bool due = changed || (DateTime.Now - lastTick).TotalSeconds >= cfg.TickSeconds || (nowSpraying && secondsLeft == 0);
             if (!due) return;
 
             lastTick = DateTime.Now;
             NameValueCollection f = new NameValueCollection();
             f["session_id"] = sessionId.ToString();
+            f["active"] = nowSpraying ? "1" : "0";
             Dictionary<string, object> r = api.Call("tick", f);
             if (r == null)
             {
@@ -853,6 +866,8 @@ namespace Peralna
                 return;
             }
             lastServerOk = DateTime.Now;
+            if (changed) Log.Write(nowSpraying ? "Spraying: billing runs" : "STOP: billing paused");
+            spraying = nowSpraying;
             Apply(r);
             if (Bool(r, "running"))
             {
@@ -861,6 +876,7 @@ namespace Peralna
             }
             Log.Write("Session " + sessionId + " ended by server (" + Str(r, "end_reason") + ")");
             sessionId = 0;
+            spraying = false;
             Show(Status.Stopped, false);
         }
     }

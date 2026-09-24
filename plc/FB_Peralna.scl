@@ -13,6 +13,8 @@
 //   Regs[0] enable 1/0 · Regs[1] seconds left · Regs[2] balance · Regs[3] charged
 //   Regs[4] status     · Regs[5] heartbeat    · Regs[6] minutes left
 //   Regs[20] name length · Regs[21..52] card holder name, one UTF-16 character per register
+// Written back by this PLC (40011 = register 10): the program, 0 СТОП, 1 ПЕНА, 2 ВОДА.
+// The laptop bills the card only while it is 1 or 2, so СТОП stops the money running out.
 //
 // Touch panel (WinCC, e.g. KTP700 Basic): use the instance DB "FB_Peralna_DB".
 //   Text field      CardName (WString)          - card holder name
@@ -27,11 +29,11 @@
 
 FUNCTION_BLOCK "FB_Peralna"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 0.2
+VERSION : 0.3
    VAR_INPUT
       BtnFoam : Bool;    // push button "ПЕНА" on the bay
       BtnWater : Bool;   // push button "ВОДА"
-      BtnStop : Bool;    // push button "СТОП" (pauses the spray; the card is billed until it is removed)
+      BtnStop : Bool;    // push button "СТОП" (pauses the spray and the billing)
    END_VAR
 
    VAR_OUTPUT
@@ -63,6 +65,8 @@ VERSION : 0.2
       WatchdogTimer : TON;
       LastHeartbeat : Word;
       Fresh : Bool;
+      WriteTurn : Bool;     // MB_CLIENT alternates: read registers 0..52, then write the program to 10
+      ProgramWord : Word;
    END_VAR
 
    VAR_TEMP
@@ -84,15 +88,26 @@ BEGIN
    #Conn.RemotePort := 502;
    #Conn.LocalPort := 0;
 
-   // Read registers 0..52 every 300 ms.
-   #PollTimer(IN := NOT #PollTimer.Q, PT := T#300MS);
-   #Client(REQ := #PollTimer.Q,
-           DISCONNECT := FALSE,
-           MB_MODE := 0,                  // read
-           MB_DATA_ADDR := 40001,         // holding register 0
-           MB_DATA_LEN := 53,
-           MB_DATA_PTR := #Regs,
-           CONNECT := #Conn);
+   // Every 150 ms one job: read registers 0..52, then write the program to register 10.
+   #PollTimer(IN := NOT #PollTimer.Q, PT := T#150MS);
+   #ProgramWord := INT_TO_WORD(#Program);
+   IF #WriteTurn THEN
+      #Client(REQ := #PollTimer.Q,
+              DISCONNECT := FALSE,
+              MB_MODE := 1,               // write
+              MB_DATA_ADDR := 40011,      // holding register 10
+              MB_DATA_LEN := 1,
+              MB_DATA_PTR := #ProgramWord,
+              CONNECT := #Conn);
+   ELSE
+      #Client(REQ := #PollTimer.Q,
+              DISCONNECT := FALSE,
+              MB_MODE := 0,               // read
+              MB_DATA_ADDR := 40001,      // holding register 0
+              MB_DATA_LEN := 53,
+              MB_DATA_PTR := #Regs,
+              CONNECT := #Conn);
+   END_IF;
 
    IF #Client.ERROR THEN
       #CommError := TRUE;
@@ -103,12 +118,15 @@ BEGIN
 
    // ── Watchdog: the laptop bumps Regs[5] every second ──────────
    // No new heartbeat for 5 s (laptop frozen, cable out, agent closed) = stop.
-   #Fresh := #Client.DONE AND (#Regs[5] <> #LastHeartbeat);
+   #Fresh := #Client.DONE AND NOT #WriteTurn AND (#Regs[5] <> #LastHeartbeat);
    IF #Fresh THEN
       #LastHeartbeat := #Regs[5];
    END_IF;
    #WatchdogTimer(IN := NOT #Fresh, PT := T#5S);
    #CommOk := NOT #WatchdogTimer.Q;
+   IF #Client.DONE OR #Client.ERROR THEN
+      #WriteTurn := NOT #WriteTurn;
+   END_IF;
 
    // ── Bay ──────────────────────────────────────────────────────
    #Enabled := #CommOk AND (#Regs[0] = 1);

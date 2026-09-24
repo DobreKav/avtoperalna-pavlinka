@@ -17,7 +17,7 @@ namespace PeralnaSetup
     static class Product
     {
         public const string Name = "Автоперална Павлинка";
-        public const string Version = "1.1.1";
+        public const string Version = "1.2.0";
         public const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\AvtoperalnaPavlinka";
         public const string FirewallRule = "Avtoperalna Pavlinka - PLC Modbus 502";
         public const string AdminUrl = "http://localhost:8080/";

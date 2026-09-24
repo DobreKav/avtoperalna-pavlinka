@@ -40,6 +40,13 @@ function db(): PDO
                 ->execute([DEMO_UID, DEMO_BALANCE]);
             $pdo->exec('PRAGMA user_version = 2');
         }
+        if ((int)$pdo->query('PRAGMA user_version')->fetchColumn() < 3) {
+            // Billing runs only while foam or water is on (the PLC reports it). active_since is
+            // NULL while paused; active_seconds holds the time of the finished active stretches.
+            $pdo->exec('ALTER TABLE sessions ADD COLUMN active_seconds INTEGER NOT NULL DEFAULT 0');
+            $pdo->exec('ALTER TABLE sessions ADD COLUMN active_since TEXT NULL');
+            $pdo->exec('PRAGMA user_version = 3');
+        }
     }
     return $pdo;
 }
@@ -271,7 +278,8 @@ function find_machine(string $code): ?array
 // ─── Machine sessions (card sits in the reader) ─────────────────
 //
 // The card is billed per second at rate_per_minute / 60, rounded up to whole
-// denars, from the moment the reader starts the session. The balance on the
+// denars, but only while the bay is spraying (foam or water chosen on the PLC).
+// A session starts paused; СТОП on the bay pauses it again. The balance on the
 // card goes down on every reader report; the ledger gets one row per session
 // when the card comes out.
 
@@ -293,9 +301,34 @@ function lock_session(int $sessionId): array
  * Charges everything owed up to $untilUtc. Must run inside a DB transaction
  * with the session and card rows locked. Returns [session, card, exhausted].
  */
+function active_seconds(array $session, string $untilUtc): int
+{
+    $seconds = (int)$session['active_seconds'];
+    if ($session['active_since'] !== null) {
+        $seconds += max(0, utc_ts($untilUtc) - utc_ts($session['active_since']));
+    }
+    return $seconds;
+}
+
+/** Starts or pauses the billing clock at $atUtc. Runs inside the session's transaction. */
+function set_active(array $session, bool $active, string $atUtc): array
+{
+    if ($active && $session['active_since'] === null) {
+        $session['active_since'] = $atUtc;
+    } elseif (!$active && $session['active_since'] !== null) {
+        $session['active_seconds'] = active_seconds($session, $atUtc);
+        $session['active_since'] = null;
+    } else {
+        return $session;
+    }
+    db()->prepare('UPDATE sessions SET active_seconds = ?, active_since = ? WHERE id = ?')
+        ->execute([$session['active_seconds'], $session['active_since'], $session['id']]);
+    return $session;
+}
+
 function accrue(array $session, array $card, string $untilUtc): array
 {
-    $elapsed = max(0, utc_ts($untilUtc) - utc_ts($session['started_at']));
+    $elapsed = active_seconds($session, $untilUtc);
     $due = (int)ceil($elapsed * (int)$session['rate_per_minute'] / 60);
     $delta = max(0, $due - (int)$session['charged']);
     $exhausted = false;
@@ -317,10 +350,11 @@ function accrue(array $session, array $card, string $untilUtc): array
 function end_session(array $session, array $card, string $reason, string $source, ?int $userId = null): array
 {
     $endedAt = $reason === 'timeout' ? $session['last_seen_at'] : utc_now();
+    $session = set_active($session, false, $endedAt);
     db()->prepare("UPDATE sessions SET status = 'ended', ended_at = ?, end_reason = ? WHERE id = ?")
         ->execute([$endedAt, $reason, $session['id']]);
     if ((int)$session['charged'] > 0) {
-        $minutes = (int)ceil((utc_ts($endedAt) - utc_ts($session['started_at'])) / 60);
+        $minutes = (int)ceil((int)$session['active_seconds'] / 60);
         insert_ledger((int)$card['id'], 'charge', -(int)$session['charged'], (int)$card['balance'], [
             'session_id' => (int)$session['id'],
             'machine_id' => (int)$session['machine_id'],
@@ -347,6 +381,7 @@ function session_payload(array $session, array $card, bool $running): array
         'seconds_left' => $running ? seconds_left((int)$card['balance'], (int)$session['rate_per_minute']) : 0,
         'end_reason' => $session['end_reason'] ?? null,
         'holder_name' => (string)($card['holder_name'] ?: $card['uid']),
+        'active' => $running && ($session['active_since'] ?? null) !== null,
     ];
 }
 
@@ -425,8 +460,11 @@ function begin_machine_session(string $machineCode, string $uid): array
     }
 }
 
-/** Reader reports that the card is still inside. */
-function tick_machine_session(int $sessionId): array
+/**
+ * Reader reports that the card is still inside. $active: foam or water is on right now
+ * (null keeps the current state).
+ */
+function tick_machine_session(int $sessionId, ?bool $active = null): array
 {
     tx_begin();
     try {
@@ -436,9 +474,12 @@ function tick_machine_session(int $sessionId): array
             tx_commit();
             return session_payload($session, $card, false);
         }
-        [$session, $card, $exhausted] = accrue($session, $card, utc_now());
+        $now = utc_now();
+        [$session, $card, $exhausted] = accrue($session, $card, $now);
         if ($exhausted || $card['status'] !== 'active') {
             $session = end_session($session, $card, $exhausted ? 'no_balance' : 'admin', 'api');
+        } elseif ($active !== null) {
+            $session = set_active($session, $active, $now);
         }
         tx_commit();
         return session_payload($session, $card, $session['status'] === 'running');

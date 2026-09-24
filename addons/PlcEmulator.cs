@@ -46,6 +46,25 @@ namespace PeralnaAddons
             }
         }
 
+        // FC6: the PLC reports its program in register 10.
+        public bool WriteSingle(string host, int port, int address, int value)
+        {
+            try
+            {
+                if (tcp == null && ReadHolding(host, port, 0, 1) == null) return false;
+                tid++;
+                byte[] req = { (byte)(tid >> 8), (byte)tid, 0, 0, 0, 6, 1, 6, (byte)(address >> 8), (byte)address, (byte)(value >> 8), (byte)value };
+                stream.Write(req, 0, req.Length);
+                byte[] resp = Read(12);
+                return (resp[7] & 0x80) == 0;
+            }
+            catch (Exception)
+            {
+                Close();
+                return false;
+            }
+        }
+
         byte[] Read(int n)
         {
             byte[] b = new byte[n];
@@ -103,7 +122,7 @@ namespace PeralnaAddons
         volatile int port = 502;
         int lastHeartbeat = -1;
         DateTime lastHeartbeatChange = DateTime.MinValue;
-        int program;   // 0 none, 1 foam, 2 water
+        volatile int program;   // 0 none, 1 foam, 2 water; written to register 10 for billing
 
         public PlcEmulatorForm()
         {
@@ -266,7 +285,8 @@ namespace PeralnaAddons
             while (true)
             {
                 regs = modbus.ReadHolding(host, port, 0, RegCount);
-                Thread.Sleep(300);
+                if (regs != null) modbus.WriteSingle(host, port, 10, program);
+                Thread.Sleep(250);
             }
         }
 
@@ -312,7 +332,7 @@ namespace PeralnaAddons
                 ? "Салдо: " + r[2] + " ден.   ·   Наплатено: " + r[3] + " ден.   ·   " + secondsLeft + " s"
                 : "";
             string statusText = !commOk ? "Нема врска со компјутерот — излезите се исклучени"
-                : enabled ? (program == 1 ? "ПЕНА тече" : program == 2 ? "ВОДА тече" : "Избери ПЕНА или ВОДА")
+                : enabled ? (program == 1 ? "ПЕНА тече · се наплаќа" : program == 2 ? "ВОДА тече · се наплаќа" : "СТОП · не се наплаќа · избери ПЕНА или ВОДА")
                 : Brand.StatusText(status);
             hmiStatus.Text = statusText;
             hmiStatus.ForeColor = !commOk || (status >= 2 && !enabled) ? Color.FromArgb(0xFF, 0x8A, 0x80) : Color.FromArgb(0xA5, 0xD6, 0xA7);
