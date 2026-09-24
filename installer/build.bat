@@ -13,6 +13,10 @@ mkdir "%STAGE%\php\ext" "%STAGE%\data" "%STAGE%\app" "%STAGE%\www" "%STAGE%\plc"
 echo [1/4] Agent
 "%CSC%" /nologo /optimize /out:"%STAGE%\PeralnaAgent.exe" /win32icon:app.ico /r:System.Web.Extensions.dll ..\agent\PeralnaAgent.cs || goto :fail
 
+echo      Add-ons
+"%CSC%" /nologo /optimize /target:winexe /out:"%STAGE%\CardEmulator.exe" /win32icon:app.ico /r:System.Windows.Forms.dll /r:System.Drawing.dll ..\addons\Common.cs ..\addons\CardEmulator.cs || goto :fail
+"%CSC%" /nologo /optimize /target:winexe /out:"%STAGE%\PlcEmulator.exe" /win32icon:app.ico /r:System.Windows.Forms.dll /r:System.Drawing.dll ..\addons\Common.cs ..\addons\PlcEmulator.cs || goto :fail
+
 echo [2/4] Files
 copy /Y ..\agent\agent.ini "%STAGE%\" >nul
 copy /Y ..\README.md "%STAGE%\" >nul

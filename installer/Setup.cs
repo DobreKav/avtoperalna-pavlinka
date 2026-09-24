@@ -17,7 +17,7 @@ namespace PeralnaSetup
     static class Product
     {
         public const string Name = "Автоперална Павлинка";
-        public const string Version = "1.0.1";
+        public const string Version = "1.1.0";
         public const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\AvtoperalnaPavlinka";
         public const string FirewallRule = "Avtoperalna Pavlinka - PLC Modbus 502";
         public const string AdminUrl = "http://localhost:8080/";
@@ -27,6 +27,8 @@ namespace PeralnaSetup
         public static string StartupLink { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup), Name + " — агент.lnk"); } }
         public static string AgentLinkName { get { return Name + " — агент.lnk"; } }
         public static string AdminLinkName { get { return Name + " — админ панел.url"; } }
+        public const string CardEmuLinkName = "Емулатор — читач на картички.lnk";
+        public const string PlcEmuLinkName = "Емулатор — PLC S7-1200.lnk";
     }
 
     class SetupForm : Form
@@ -150,12 +152,16 @@ namespace PeralnaSetup
                 Shortcut(Path.Combine(Product.Menu, Product.AgentLinkName), agent, "", dir, agent, 1);
                 UrlShortcut(Path.Combine(Product.Menu, Product.AdminLinkName), Product.AdminUrl, agent);
                 Shortcut(Path.Combine(Product.Menu, "Деинсталирај.lnk"), uninstaller, "/uninstall", dir, agent, 1);
+                Shortcut(Path.Combine(Product.Menu, Product.CardEmuLinkName), Path.Combine(dir, "CardEmulator.exe"), "", dir, Path.Combine(dir, "CardEmulator.exe"), 1);
+                Shortcut(Path.Combine(Product.Menu, Product.PlcEmuLinkName), Path.Combine(dir, "PlcEmulator.exe"), "", dir, Path.Combine(dir, "PlcEmulator.exe"), 1);
                 if (autoStart.Checked) Shortcut(Product.StartupLink, agent, "", dir, agent, 7);
                 else if (File.Exists(Product.StartupLink)) File.Delete(Product.StartupLink);
                 if (desktop.Checked)
                 {
                     Shortcut(Path.Combine(Product.Desktop, Product.AgentLinkName), agent, "", dir, agent, 1);
                     UrlShortcut(Path.Combine(Product.Desktop, Product.AdminLinkName), Product.AdminUrl, agent);
+                    Shortcut(Path.Combine(Product.Desktop, Product.CardEmuLinkName), Path.Combine(dir, "CardEmulator.exe"), "", dir, Path.Combine(dir, "CardEmulator.exe"), 1);
+                    Shortcut(Path.Combine(Product.Desktop, Product.PlcEmuLinkName), Path.Combine(dir, "PlcEmulator.exe"), "", dir, Path.Combine(dir, "PlcEmulator.exe"), 1);
                 }
 
                 if (firewall.Checked)
@@ -205,7 +211,7 @@ namespace PeralnaSetup
         public static void StopRunning(string dir)
         {
             string root = Path.GetFullPath(dir).TrimEnd('\\') + "\\";
-            foreach (string name in new[] { "PeralnaAgent", "php" })
+            foreach (string name in new[] { "PeralnaAgent", "CardEmulator", "PlcEmulator", "php" })
             {
                 foreach (Process p in Process.GetProcessesByName(name))
                 {
@@ -323,13 +329,15 @@ namespace PeralnaSetup
             foreach (string f in new[] {
                 Product.StartupLink,
                 Path.Combine(Product.Desktop, Product.AgentLinkName),
-                Path.Combine(Product.Desktop, Product.AdminLinkName) })
+                Path.Combine(Product.Desktop, Product.AdminLinkName),
+                Path.Combine(Product.Desktop, Product.CardEmuLinkName),
+                Path.Combine(Product.Desktop, Product.PlcEmuLinkName) })
                 TryDelete(f);
             try { if (Directory.Exists(Product.Menu)) Directory.Delete(Product.Menu, true); } catch { }
             try { Registry.LocalMachine.DeleteSubKeyTree(Product.UninstallKey, false); } catch { }
             foreach (string sub in new[] { "php", "www", "app", "plc" })
                 try { if (Directory.Exists(Path.Combine(dir, sub))) Directory.Delete(Path.Combine(dir, sub), true); } catch { }
-            foreach (string f in new[] { "PeralnaAgent.exe", "README.md", "uninstall.bat" })
+            foreach (string f in new[] { "PeralnaAgent.exe", "CardEmulator.exe", "PlcEmulator.exe", "README.md", "uninstall.bat" })
                 TryDelete(Path.Combine(dir, f));
 
             // This exe cannot delete itself while it runs: cmd removes it a moment later.

@@ -10,6 +10,8 @@
 //   5  heartbeat       +1 every second; if it stops changing, the PLC must stop the machine
 //   6  minutes left
 //   10-19              free for the PLC to write (FC6/FC16), e.g. machine feedback
+//   20 name length     card holder name for the touch panel, in characters (max 32)
+//   21-52 name         one UTF-16 character per register (Cyrillic works; WString on the PLC)
 using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
@@ -49,6 +51,7 @@ namespace Peralna
         public bool Simulate = false;
         public int WebPort = 8080;          // 0 = do not start the built-in web server (e.g. under XAMPP)
         public string WebBind = "127.0.0.1";
+        public int VirtualReaderPort = 5021; // CardEmulator.exe add-on; 0 = off
 
         public static Config Load(string path)
         {
@@ -72,6 +75,7 @@ namespace Peralna
                     case "offline_stop_seconds": c.OfflineStopSeconds = Math.Max(10, int.Parse(val)); break;
                     case "web_port": c.WebPort = int.Parse(val); break;
                     case "web_bind": c.WebBind = val; break;
+                    case "virtual_reader_port": c.VirtualReaderPort = int.Parse(val); break;
                     case "simulate": c.Simulate = val == "1" || val.ToLowerInvariant() == "true"; break;
                 }
             }
@@ -318,6 +322,86 @@ namespace Peralna
         }
     }
 
+    // ─── Virtual card reader (CardEmulator.exe add-on) ───────────
+    //
+    // Line protocol on 127.0.0.1, UTF-8:
+    //   emulator -> agent:  HELLO <name> | IN <uid> | OUT
+    //   agent -> emulator:  STATE <status>|<enable>|<balance>|<seconds>|<charged>|<holder name>   (every second)
+
+    class VirtualReader
+    {
+        readonly Queue<string> events = new Queue<string>();
+        readonly object gate = new object();
+        StreamWriter writer;
+        public volatile bool Connected;
+        public string Name = "";
+
+        public void Start(int port)
+        {
+            TcpListener listener = new TcpListener(IPAddress.Loopback, port);
+            listener.Start();
+            Log.Write("Virtual card reader port " + port + " (CardEmulator.exe)");
+            Thread t = new Thread(delegate ()
+            {
+                while (true)
+                {
+                    TcpClient client = listener.AcceptTcpClient();
+                    Thread h = new Thread(delegate () { Serve(client); });
+                    h.IsBackground = true;
+                    h.Start();
+                }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        void Serve(TcpClient client)
+        {
+            try
+            {
+                using (client)
+                using (NetworkStream s = client.GetStream())
+                using (StreamReader r = new StreamReader(s, new UTF8Encoding(false)))
+                {
+                    lock (gate) { writer = new StreamWriter(s, new UTF8Encoding(false)); writer.AutoFlush = true; }
+                    string line;
+                    while ((line = r.ReadLine()) != null)
+                    {
+                        line = line.Trim();
+                        if (line.StartsWith("HELLO"))
+                        {
+                            Name = line.Length > 6 ? line.Substring(6).Trim() : "emulator";
+                            Connected = true;
+                            Log.Write("Virtual card reader connected: " + Name);
+                        }
+                        else if (line.StartsWith("IN ") || line == "OUT")
+                        {
+                            lock (events) events.Enqueue(line);
+                        }
+                    }
+                }
+            }
+            catch (Exception) { }
+            lock (gate) writer = null;
+            Connected = false;
+            lock (events) events.Enqueue("OUT");   // emulator closed: its card is gone too
+            Log.Write("Virtual card reader disconnected");
+        }
+
+        public string Next()
+        {
+            lock (events) return events.Count > 0 ? events.Dequeue() : null;
+        }
+
+        public void Send(string line)
+        {
+            lock (gate)
+            {
+                try { if (writer != null) writer.WriteLine(line); } catch { writer = null; }
+            }
+        }
+    }
+
     // ─── PC/SC card reader ───────────────────────────────────────
 
     static class PcSc
@@ -462,6 +546,8 @@ namespace Peralna
         readonly List<int> pendingStops = new List<int>();
         readonly Queue<string> commands = new Queue<string>();
         string simulatedUid;
+        bool simActive;     // the card came from the virtual reader (CardEmulator.exe)
+        readonly VirtualReader virtualReader = new VirtualReader();
 
         public Agent(Config cfg) { this.cfg = cfg; api = new Api(cfg); }
 
@@ -496,11 +582,23 @@ namespace Peralna
             secondsLeft = Int(r, "seconds_left");
             regs.Set(1, secondsLeft);
             regs.Set(6, secondsLeft / 60);
+            object name;
+            if (r != null && r.TryGetValue("holder_name", out name) && name != null) SetName(name.ToString());
+        }
+
+        const int NameLength = 20, NameStart = 21, NameMax = 32;
+
+        void SetName(string name)
+        {
+            if (name.Length > NameMax) name = name.Substring(0, NameMax);
+            for (int i = 0; i < NameMax; i++) regs.Set(NameStart + i, i < name.Length ? name[i] : 0);
+            regs.Set(NameLength, name.Length);
         }
 
         public void Run()
         {
             new ModbusServer(regs, cfg.ModbusPort).Start();
+            if (cfg.VirtualReaderPort > 0) virtualReader.Start(cfg.VirtualReaderPort);
             Show(Status.NoReader, false);
             Dictionary<string, object> ping = api.Call("ping", new NameValueCollection());
             Log.Write(ping != null && Bool(ping, "ok") ? "Billing server OK: " + cfg.Server : "Billing server NOT reachable: " + cfg.Server);
@@ -527,7 +625,16 @@ namespace Peralna
 
         void Step()
         {
-            if (!EnsureReader()) { Thread.Sleep(1000); EverySecond(); return; }
+            HandleVirtualReader();
+            // While the emulator's card is "inside", the real reader is ignored.
+            if (simActive) { Thread.Sleep(200); EverySecond(); return; }
+            if (!EnsureReader())
+            {
+                if (virtualReader.Connected && !cardPresent && regs.Get(4) == (int)Status.NoReader) Show(Status.Idle, false);
+                Thread.Sleep(virtualReader.Connected ? 200 : 1000);
+                EverySecond();
+                return;
+            }
 
             PcSc.READERSTATE[] st = new PcSc.READERSTATE[1];
             st[0].szReader = reader;
@@ -548,6 +655,27 @@ namespace Peralna
                 if (present) CardInserted(); else CardRemoved();
             }
             EverySecond();
+        }
+
+        void HandleVirtualReader()
+        {
+            string ev;
+            while ((ev = virtualReader.Next()) != null)
+            {
+                if (ev.StartsWith("IN ") && !cardPresent)
+                {
+                    simulatedUid = ev.Substring(3).Trim();
+                    simActive = true;
+                    cardPresent = true;
+                    CardInserted();
+                }
+                else if (ev == "OUT" && simActive)
+                {
+                    simActive = false;
+                    cardPresent = false;
+                    CardRemoved();
+                }
+            }
         }
 
         void SimulatedStep()
@@ -611,7 +739,7 @@ namespace Peralna
         void CardInserted()
         {
             string uid;
-            try { uid = cfg.Simulate ? simulatedUid : PcSc.ReadUid(ctx, reader); }
+            try { uid = cfg.Simulate || simActive ? simulatedUid : PcSc.ReadUid(ctx, reader); }
             catch (Exception ex)
             {
                 Log.Write("Could not read card: " + ex.Message);
@@ -640,6 +768,7 @@ namespace Peralna
                 : reason == "no_balance" ? Status.LowBalance
                 : Status.ServerError;
             Show(s, false);
+            SetName("");
             Log.Write("Refused: " + Str(r, "message"));
         }
 
@@ -649,6 +778,7 @@ namespace Peralna
             secondsLeft = 0;
             regs.Set(1, 0);
             regs.Set(6, 0);
+            SetName("");
             Log.Write("Card out");
             if (sessionId != 0)
             {
@@ -677,7 +807,10 @@ namespace Peralna
             lastStatus = DateTime.Now;
             NameValueCollection f = new NameValueCollection();
             f["machine"] = cfg.Machine;
-            f["reader"] = cfg.Simulate ? "SIMULATION" : (reader ?? "");
+            string readerName = cfg.Simulate ? "SIMULATION" : (reader ?? "");
+            if (virtualReader.Connected)
+                readerName = readerName.Length > 0 ? readerName + " + виртуелен" : "Виртуелен читач (" + virtualReader.Name + ")";
+            f["reader"] = readerName;
             f["card"] = cardPresent ? "1" : "0";
             f["plc"] = ModbusServer.PlcConnected() ? "1" : "0";
             f["plc_peer"] = ModbusServer.LastPeer;
@@ -689,7 +822,13 @@ namespace Peralna
             if ((DateTime.Now - lastSecond).TotalSeconds < 1) return;
             lastSecond = DateTime.Now;
             regs.Bump(5);
-            if ((DateTime.Now - lastStatus).TotalSeconds >= 5) SendStatus();
+            if (virtualReader.Connected)
+            {
+                StringBuilder name = new StringBuilder();
+                for (int i = 0; i < regs.Get(NameLength); i++) name.Append((char)regs.Get(NameStart + i));
+                virtualReader.Send("STATE " + regs.Get(4) + "|" + regs.Get(0) + "|" + regs.Get(2) + "|" + regs.Get(1) + "|" + regs.Get(3) + "|" + name);
+            }
+            if ((DateTime.Now - lastStatus).TotalSeconds >= 2) SendStatus();
             if (pendingStops.Count > 0) FlushStops();
             if (sessionId == 0) return;
 

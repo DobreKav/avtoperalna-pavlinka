@@ -336,6 +336,7 @@ function session_payload(array $session, array $card, bool $running): array
         'rate_per_minute' => (int)$session['rate_per_minute'],
         'seconds_left' => $running ? seconds_left((int)$card['balance'], (int)$session['rate_per_minute']) : 0,
         'end_reason' => $session['end_reason'] ?? null,
+        'holder_name' => (string)($card['holder_name'] ?: $card['uid']),
     ];
 }
 
