@@ -109,6 +109,14 @@ $old = db()->query('SELECT status, end_reason FROM sessions WHERE id = ' . (int)
 check('previous card session ended', $old['end_reason'], 'removed');
 check('new card runs', $s5['running'], true);
 
+// Demo card: exists after setup and refills itself when low.
+$demo = find_card_by_uid(DEMO_UID);
+check('demo card exists', $demo !== null && $demo['holder_name'] === 'Демо картичка', true);
+db()->prepare('UPDATE cards SET balance = 30 WHERE uid = ?')->execute([DEMO_UID]);
+$d = begin_machine_session('W2', DEMO_UID);
+check('demo card refills to 1000 and starts', [$d['running'], $d['balance']], [true, DEMO_BALANCE]);
+finish_machine_session($d['session_id'], 'removed', 'api');
+
 check('blocked card cannot start', reason(function () use ($b) {
     db()->prepare("UPDATE cards SET status = 'blocked' WHERE id = ?")->execute([$b]);
     begin_machine_session('W1', '04FFEE11');

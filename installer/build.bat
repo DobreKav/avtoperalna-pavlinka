@@ -39,6 +39,10 @@ echo [4/4] Setup.exe
   /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll /r:System.Windows.Forms.dll ^
   /r:System.Drawing.dll /r:Microsoft.CSharp.dll /r:System.Core.dll Setup.cs || goto :fail
 
+rem The two add-ons also as standalone downloads (they use the default ports without agent.ini)
+copy /Y "%STAGE%\CardEmulator.exe" dist\ >nul
+copy /Y "%STAGE%\PlcEmulator.exe" dist\ >nul
+
 echo.
 echo Done: %~dp0dist\AvtoperalnaPavlinka-Setup.exe
 exit /b 0

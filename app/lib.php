@@ -3,6 +3,11 @@ declare(strict_types=1);
 
 const APP_NAME = 'Автоперална Павлинка';
 
+// Card for trying the bay with the CardEmulator add-on. It refills itself and is
+// left out of the daily totals on the dashboard.
+const DEMO_UID = 'DEMO0001';
+const DEMO_BALANCE = 1000;
+
 $CONFIG = require __DIR__ . '/config.php';
 date_default_timezone_set($CONFIG['timezone']);
 
@@ -29,6 +34,11 @@ function db(): PDO
         if ((int)$pdo->query('PRAGMA user_version')->fetchColumn() < 1) {
             $pdo->exec(file_get_contents(__DIR__ . '/schema.sql'));
             $pdo->exec('PRAGMA user_version = 1');
+        }
+        if ((int)$pdo->query('PRAGMA user_version')->fetchColumn() < 2) {
+            $pdo->prepare("INSERT OR IGNORE INTO cards (uid, holder_name, balance, created_at) VALUES (?, 'Демо картичка', ?, datetime('now'))")
+                ->execute([DEMO_UID, DEMO_BALANCE]);
+            $pdo->exec('PRAGMA user_version = 2');
         }
     }
     return $pdo;
@@ -392,6 +402,12 @@ function begin_machine_session(string $machineCode, string $uid): array
         }
 
         if ($card['status'] !== 'active') throw new WalletError('Картичката е блокирана.', 'blocked');
+        if ($card['uid'] === DEMO_UID && (int)$card['balance'] < DEMO_BALANCE / 10) {
+            $refill = DEMO_BALANCE - (int)$card['balance'];
+            $card['balance'] = DEMO_BALANCE;
+            db()->prepare('UPDATE cards SET balance = ? WHERE id = ?')->execute([DEMO_BALANCE, $card['id']]);
+            insert_ledger((int)$card['id'], 'adjust', $refill, DEMO_BALANCE, ['note' => 'Демо картичка: автоматско полнење', 'source' => 'api']);
+        }
         $needed = max((int)$machine['min_balance'], 1);
         if ((int)$card['balance'] < $needed) {
             throw new WalletError('Потребно е најмалку ' . money($needed) . ' · Салдо: ' . money((int)$card['balance']), 'no_balance');

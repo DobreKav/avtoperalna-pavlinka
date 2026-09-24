@@ -29,7 +29,8 @@ $stats = db()->prepare(
         COALESCE(SUM(CASE WHEN type = 'charge' THEN -amount END), 0) AS spent,
         COALESCE(SUM(CASE WHEN type = 'topup' THEN amount END), 0) AS topups,
         COALESCE(SUM(type = 'charge'), 0) AS cycles
-     FROM transactions WHERE created_at >= ?"
+     FROM transactions
+     WHERE created_at >= ? AND card_id NOT IN (SELECT id FROM cards WHERE uid = '" . DEMO_UID . "')"
 );
 $stats->execute([$dayStart]);
 $today = $stats->fetch();

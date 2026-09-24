@@ -53,8 +53,9 @@ namespace PeralnaAddons
             uidLabel.ForeColor = Brand.Muted;
             uidLabel.SetBounds(20, 254, 400, 22);
             uidBox.SetBounds(20, 278, 400, 30);
-            uidBox.Items.AddRange(new object[] { "TEST0001", "TEST0002", "TEST0003" });
-            uidBox.Text = "TEST0001";
+            // DEMO0001 exists in every installation, refills itself and is left out of the totals.
+            uidBox.Items.AddRange(new object[] { "DEMO0001", "TEST0001", "TEST0002" });
+            uidBox.Text = "DEMO0001";
             uidBox.TextChanged += delegate { if (!inserted) { card.Uid = Uid(); card.Invalidate(); } };
 
             insert.SetBounds(20, 318, 400, 50);
@@ -74,7 +75,7 @@ namespace PeralnaAddons
             machineText.SetBounds(242, 436, 180, 24);
 
             Label hint = new Label();
-            hint.Text = "Нова картичка? Стави ја, па во админ панелот кликни „Регистрирај ја“ и наполни ја.";
+            hint.Text = "DEMO0001 е демо картичка: секогаш има пари. Друга картичка: стави ја, па во админ панелот кликни „Регистрирај ја“.";
             hint.ForeColor = Brand.Muted;
             hint.Font = new Font("Segoe UI", 9f);
             hint.SetBounds(20, 470, 400, 40);
@@ -239,7 +240,7 @@ namespace PeralnaAddons
             using (Font mono = new Font("Consolas", 15f, FontStyle.Bold))
                 g.DrawString(Uid.Length > 0 ? Uid : "—", mono, Brushes.White, r.X + 22, r.Y + 104);
             using (Font small = new Font("Segoe UI", 10f))
-                g.DrawString(Holder.Length > 0 ? Holder : (Inserted ? "" : "картичка за тест"), small, Brushes.White, r.X + 22, r.Y + 140);
+                g.DrawString(Holder.Length > 0 ? Holder : (Uid == "DEMO0001" ? "Демо картичка" : (Inserted ? "" : "картичка за тест")), small, Brushes.White, r.X + 22, r.Y + 140);
             if (Inserted)
             {
                 using (Font tag = new Font("Segoe UI", 9f, FontStyle.Bold))
