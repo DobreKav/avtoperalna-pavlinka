@@ -1,0 +1,119 @@
+// Peralna self-service bay (foam + water) for a Siemens S7-1200.
+// The laptop is the Modbus TCP server (PeralnaAgent.exe, port 502); this PLC is the client.
+//
+// TIA Portal: Program blocks > External source files > Add new external file > this file,
+// right click > "Generate blocks from source". Then call "FB_Peralna" from OB1 (see bottom).
+//
+// Before downloading, set the laptop IP address in the four ADDR lines below and check
+// InterfaceId: it is the "Hardware identifier" of the PLC's PROFINET interface
+// (Device configuration > PROFINET interface > System constants, usually 64).
+//
+// Laptop registers read here (40001 = register 0):
+//   Regs[0] enable 1/0 · Regs[1] seconds left · Regs[2] balance · Regs[3] charged
+//   Regs[4] status     · Regs[5] heartbeat    · Regs[6] minutes left
+
+FUNCTION_BLOCK "FB_Peralna"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT
+      BtnFoam : Bool;    // push button "PENA"
+      BtnWater : Bool;   // push button "VODA"
+      BtnStop : Bool;    // push button "STOP" (pauses the spray; the card is billed until it is removed)
+   END_VAR
+
+   VAR_OUTPUT
+      Foam : Bool;         // output to the foam pump / valve
+      Water : Bool;        // output to the water pump / valve
+      Enabled : Bool;      // card inside, money on it, link to the laptop is healthy
+      CommOk : Bool;       // laptop heartbeat seen within the last 5 s
+      SecondsLeft : UInt;
+      MinutesLeft : UInt;
+      Balance : UInt;      // denars on the card
+      Charged : UInt;      // denars charged this session
+      Status : UInt;       // 0 no card, 1 running, 2 money used up, 3 not enough money,
+                           // 4 unknown card, 5 blocked, 6 server error, 7 no reader, 8 read error
+      CommError : Bool;    // MB_CLIENT reported an error (see CommStatus)
+      CommStatus : Word;
+   END_VAR
+
+   VAR
+      Client : MB_CLIENT;
+      Conn : TCON_IP_v4;
+      Regs : Array[0..6] of Word;
+      PollTimer : TON;
+      WatchdogTimer : TON;
+      LastHeartbeat : Word;
+      Fresh : Bool;
+      Program : Int;       // 0 none, 1 foam, 2 water
+   END_VAR
+
+BEGIN
+   // ── Connection to the laptop ─────────────────────────────────
+   #Conn.InterfaceId := 64;               // PROFINET interface hardware id
+   #Conn.ID := 1;                         // any free connection id
+   #Conn.ConnectionType := 16#0B;         // TCP
+   #Conn.ActiveEstablished := TRUE;       // the PLC opens the connection (client)
+   #Conn.RemoteAddress.ADDR[1] := 192;    // laptop IP address
+   #Conn.RemoteAddress.ADDR[2] := 168;
+   #Conn.RemoteAddress.ADDR[3] := 1;
+   #Conn.RemoteAddress.ADDR[4] := 10;
+   #Conn.RemotePort := 502;
+   #Conn.LocalPort := 0;
+
+   // Read registers 0..6 every 300 ms.
+   #PollTimer(IN := NOT #PollTimer.Q, PT := T#300MS);
+   #Client(REQ := #PollTimer.Q,
+           DISCONNECT := FALSE,
+           MB_MODE := 0,                  // read
+           MB_DATA_ADDR := 40001,         // holding register 0
+           MB_DATA_LEN := 7,
+           MB_DATA_PTR := #Regs,
+           CONNECT := #Conn);
+
+   IF #Client.ERROR THEN
+      #CommError := TRUE;
+      #CommStatus := #Client.STATUS;
+   ELSIF #Client.DONE THEN
+      #CommError := FALSE;
+   END_IF;
+
+   // ── Watchdog: the laptop bumps Regs[5] every second ──────────
+   // No new heartbeat for 5 s (laptop frozen, cable out, agent closed) = stop.
+   #Fresh := #Client.DONE AND (#Regs[5] <> #LastHeartbeat);
+   IF #Fresh THEN
+      #LastHeartbeat := #Regs[5];
+   END_IF;
+   #WatchdogTimer(IN := NOT #Fresh, PT := T#5S);
+   #CommOk := NOT #WatchdogTimer.Q;
+
+   // ── Machine ──────────────────────────────────────────────────
+   #Enabled := #CommOk AND (#Regs[0] = 1);
+
+   IF NOT #Enabled OR #BtnStop THEN
+      #Program := 0;
+   ELSIF #BtnFoam THEN
+      #Program := 1;
+   ELSIF #BtnWater THEN
+      #Program := 2;
+   END_IF;
+
+   #Foam := #Enabled AND (#Program = 1);
+   #Water := #Enabled AND (#Program = 2);
+
+   // ── Values for a display / LEDs ──────────────────────────────
+   #SecondsLeft := WORD_TO_UINT(#Regs[1]);
+   #Balance := WORD_TO_UINT(#Regs[2]);
+   #Charged := WORD_TO_UINT(#Regs[3]);
+   #Status := WORD_TO_UINT(#Regs[4]);
+   #MinutesLeft := WORD_TO_UINT(#Regs[6]);
+END_FUNCTION_BLOCK
+
+// ── Call in OB1 (Main), in SCL or as a box in LAD ──────────────
+//
+//   "FB_Peralna_DB"(BtnFoam  := "I_Pena",
+//                   BtnWater := "I_Voda",
+//                   BtnStop  := "I_Stop",
+//                   Foam     => "Q_Pena",
+//                   Water    => "Q_Voda");
+//
+// Tags (example): I_Pena %I0.0, I_Voda %I0.1, I_Stop %I0.2, Q_Pena %Q0.0, Q_Voda %Q0.1

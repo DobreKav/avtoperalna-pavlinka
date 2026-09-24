@@ -1,0 +1,8 @@
+# Runtime data: cards and payments stay on the laptop
+data/
+# Build output (the Setup.exe is published as a GitHub Release asset)
+installer/build/
+installer/dist/
+agent/PeralnaAgent.exe
+agent/agent.log
+*.log
