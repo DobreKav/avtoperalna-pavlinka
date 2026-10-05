@@ -71,9 +71,15 @@ page_header('Машини', $user, true);
   </div>
   <div class="link-status <?= $plcOk ? 'on' : 'off' ?>">
     <i></i>
-    <div><b>PLC (S7-1200)</b><small><?= !$statusFresh ? 'Непознато (агентот не се јавува)' : ($plcOk ? 'Поврзан · ' . e($plcPeer) : 'Не е поврзан') ?></small></div>
+    <div><b>PLC (S7-1200)</b><small><?= !$statusFresh ? 'Непознато (агентот не се јавува)' : ($plcOk ? 'Поврзан · ' . e($plcPeer) : 'Не е поврзан') ?></small>
+      <?php $plcError = (string)setting('plc_error'); if ($statusFresh && !$plcOk && $plcError !== ''): ?><small class="plc-error"><?= e($plcError) ?></small><?php endif; ?>
+      <small><a href="plc.php">Поставки за IP и порта →</a></small></div>
   </div>
 </div>
+
+<?php if (test_mode()): ?>
+<div class="flash warn">🧪 Вклучен е <b>тест режим</b>: емулаторите и демо картичката работат. За вистинска работа исклучи го во <a href="plc.php">PLC врска</a>.</div>
+<?php endif; ?>
 
 <?php if ($showUnknown): ?>
 <div class="flash warn">

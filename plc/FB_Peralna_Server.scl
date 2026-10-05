@@ -1,0 +1,174 @@
+// Автоперална Павлинка: self-service bay (foam + water) for a Siemens S7-1200 (FW 4.2 or newer).
+// Variant for "PLC-то е сервер" on the admin panel page "PLC врска": this PLC is the Modbus TCP
+// SERVER (MB_SERVER) and the laptop (PeralnaAgent.exe) connects to it. The laptop's IP address
+// is not needed here; type the PLC's IP and port into the admin panel instead.
+// (For "Лаптопот е сервер" use FB_Peralna.scl, where the PLC is the client.)
+//
+// TIA Portal: Program blocks > External source files > Add new external file > this file,
+// right click > "Generate blocks from source". Then call "FB_Peralna_Server" from OB1 (see bottom).
+//
+// Before downloading:
+//   - PLC IP address: Device configuration > PROFINET interface > Ethernet addresses
+//     (e.g. 192.168.1.20, mask 255.255.255.0). The same address goes into the admin panel.
+//   - LocalPort below (502) must match "Порта на PLC-то" in the admin panel.
+//   - InterfaceId is the "Hardware identifier" of the PROFINET interface (System constants, usually 64).
+//   - MB_SERVER V5 or newer (TIA V15+) accepts MB_HOLD_REG in this optimized block. With an older
+//     MB_SERVER, move Regs into a global DB with "Optimized block access" switched OFF and pass that.
+//
+// Holding registers written by the laptop (40001 = register 0, same map as FB_Peralna.scl):
+//   Regs[0] enable 1/0 · Regs[1] seconds left · Regs[2] balance · Regs[3] charged
+//   Regs[4] status     · Regs[5] heartbeat    · Regs[6] minutes left
+//   Regs[20] name length · Regs[21..52] card holder name, one UTF-16 character per register
+// Written by this PLC and read by the laptop (40011 = register 10): the program, 0 СТОП, 1 ПЕНА, 2 ВОДА.
+// Registers 10..19 belong to the PLC; the laptop never writes them.
+//
+// Touch panel (WinCC, e.g. KTP700 Basic): use the instance DB "FB_Peralna_DB".
+//   Text field      CardName (WString)          - card holder name
+//   I/O field       SecondsLeft (UInt)          - format 999 or use MinutesLeft/SecondsPart as mm:ss
+//   I/O field       Balance (UInt)              - "Салдо"
+//   Symbolic field  Status (UInt) + text list   - 0 Стави картичка · 1 Работи · 2 Парите се потрошени ·
+//                                                 3 Нема доволно пари · 4 Непозната картичка ·
+//                                                 5 Блокирана картичка · 6 Грешка на серверот ·
+//                                                 7 Нема читач · 8 Картичката не се чита
+//   Buttons         HmiFoam / HmiWater / HmiStop - event Press: SetBit, Release: ResetBit
+//   Lamps           Foam, Water, CommOk; Program (0 none, 1 ПЕНА, 2 ВОДА) for the active button colour
+
+FUNCTION_BLOCK "FB_Peralna_Server"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT
+      BtnFoam : Bool;    // push button "ПЕНА" on the bay
+      BtnWater : Bool;   // push button "ВОДА"
+      BtnStop : Bool;    // push button "СТОП" (pauses the spray and the billing)
+   END_VAR
+
+   VAR_OUTPUT
+      Foam : Bool;          // output to the foam pump / valve
+      Water : Bool;         // output to the water pump / valve
+      Enabled : Bool;       // card inside, money on it, link to the laptop is healthy
+      CommOk : Bool;        // laptop heartbeat seen within the last 5 s
+      Program : Int;        // 0 none, 1 foam, 2 water
+      CardName : WString[32];
+      SecondsLeft : UInt;
+      MinutesLeft : UInt;
+      SecondsPart : UInt;   // SecondsLeft MOD 60, for an mm:ss display
+      SecondsBCD : Word;    // 4-digit BCD of SecondsLeft (max 9999) for a digital seconds display on a QW
+      Balance : UInt;       // denars on the card
+      Charged : UInt;       // denars charged this session
+      Status : UInt;        // see the text list above
+      CommError : Bool;     // MB_SERVER reported an error (see CommStatus)
+      CommStatus : Word;
+   END_VAR
+
+   VAR
+      HmiFoam : Bool;       // written by the touch panel buttons
+      HmiWater : Bool;
+      HmiStop : Bool;
+      Server : MB_SERVER;
+      Conn : TCON_IP_v4;
+      Regs : Array[0..52] of Word;   // Modbus holding registers 0..52 (40001..40053)
+      WatchdogTimer : TON;
+      LastHeartbeat : Word;
+      Fresh : Bool;
+   END_VAR
+
+   VAR_TEMP
+      i : Int;
+      len : Int;
+      digits : UInt;
+   END_VAR
+
+BEGIN
+   // ── Modbus TCP server: the laptop connects here ─────────────
+   #Conn.InterfaceId := 64;               // PROFINET interface hardware id
+   #Conn.ID := 1;                         // any free connection id
+   #Conn.ConnectionType := 16#0B;         // TCP
+   #Conn.ActiveEstablished := FALSE;      // passive: the laptop opens the connection
+   #Conn.RemoteAddress.ADDR[1] := 0;      // 0.0.0.0 = accept the laptop from any address
+   #Conn.RemoteAddress.ADDR[2] := 0;
+   #Conn.RemoteAddress.ADDR[3] := 0;
+   #Conn.RemoteAddress.ADDR[4] := 0;
+   #Conn.RemotePort := 0;
+   #Conn.LocalPort := 502;                // "Порта на PLC-то" in the admin panel
+
+   // The program chosen on the bay goes to register 10 for the laptop to read.
+   #Regs[10] := INT_TO_WORD(#Program);
+
+   #Server(DISCONNECT := FALSE,
+           MB_HOLD_REG := #Regs,
+           CONNECT := #Conn);
+
+   IF #Server.ERROR THEN
+      #CommError := TRUE;
+      #CommStatus := #Server.STATUS;
+   ELSIF #Server.NDR OR #Server.DR THEN
+      #CommError := FALSE;
+   END_IF;
+
+   // ── Watchdog: the laptop writes a new Regs[5] every second ───
+   // No new heartbeat for 5 s (laptop frozen, cable out, agent closed) = stop.
+   #Fresh := #Regs[5] <> #LastHeartbeat;
+   IF #Fresh THEN
+      #LastHeartbeat := #Regs[5];
+   END_IF;
+   #WatchdogTimer(IN := NOT #Fresh, PT := T#5S);
+   #CommOk := NOT #WatchdogTimer.Q;
+
+   // ── Bay ──────────────────────────────────────────────────────
+   #Enabled := #CommOk AND (#Regs[0] = 1);
+
+   IF NOT #Enabled OR #BtnStop OR #HmiStop THEN
+      #Program := 0;
+   ELSIF #BtnFoam OR #HmiFoam THEN
+      #Program := 1;
+   ELSIF #BtnWater OR #HmiWater THEN
+      #Program := 2;
+   END_IF;
+
+   #Foam := #Enabled AND (#Program = 1);
+   #Water := #Enabled AND (#Program = 2);
+
+   // ── Values for the touch panel and the seconds display ───────
+   #Balance := WORD_TO_UINT(#Regs[2]);
+   #Charged := WORD_TO_UINT(#Regs[3]);
+   #Status := WORD_TO_UINT(#Regs[4]);
+   IF #Enabled THEN
+      #SecondsLeft := WORD_TO_UINT(#Regs[1]);
+   ELSE
+      #SecondsLeft := 0;
+   END_IF;
+   #MinutesLeft := #SecondsLeft / 60;
+   #SecondsPart := #SecondsLeft MOD 60;
+
+   #digits := #SecondsLeft;
+   IF #digits > 9999 THEN
+      #digits := 9999;
+   END_IF;
+   #SecondsBCD := UINT_TO_WORD(#digits MOD 10)
+      OR SHL(IN := UINT_TO_WORD((#digits / 10) MOD 10), N := 4)
+      OR SHL(IN := UINT_TO_WORD((#digits / 100) MOD 10), N := 8)
+      OR SHL(IN := UINT_TO_WORD(#digits / 1000), N := 12);
+
+   // Card holder name (Cyrillic): one UTF-16 character per register.
+   #len := WORD_TO_INT(#Regs[20]);
+   IF #len > 32 THEN
+      #len := 32;
+   END_IF;
+   #CardName := WSTRING#'';
+   FOR #i := 0 TO #len - 1 DO
+      #CardName := CONCAT(IN1 := #CardName, IN2 := WCHAR_TO_WSTRING(WORD_TO_WCHAR(#Regs[21 + #i])));
+   END_FOR;
+END_FUNCTION_BLOCK
+
+// ── Call in OB1 (Main), in SCL or as a box in LAD ──────────────
+// (the touch panel uses the instance DB "FB_Peralna_Server_DB" the same way as FB_Peralna_DB)
+//
+//   "FB_Peralna_Server_DB"(BtnFoam  := "I_Pena",
+//                   BtnWater := "I_Voda",
+//                   BtnStop  := "I_Stop",
+//                   Foam     => "Q_Pena",
+//                   Water    => "Q_Voda",
+//                   SecondsBCD => "QW_Sekundarnik");
+//
+// Tags (example): I_Pena %I0.0, I_Voda %I0.1, I_Stop %I0.2, Q_Pena %Q0.0, Q_Voda %Q0.1,
+// QW_Sekundarnik %QW2 (4-digit BCD display; leave it out if the display is driven by the touch panel only)

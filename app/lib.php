@@ -140,6 +140,91 @@ function setting(string $key, ?string $value = null): ?string
     return $v === false ? null : (string)$v;
 }
 
+// ─── PLC link settings (edited on plc.php, read by the agent) ───
+//
+// Two ways to wire the laptop and the S7-1200 over Modbus TCP:
+//   server  the laptop listens (listen_ip:listen_port), the PLC connects with MB_CLIENT
+//           (plc\FB_Peralna.scl). The laptop's IP is typed into the PLC program.
+//   client  the laptop connects to the PLC (plc_ip:plc_port), the PLC runs MB_SERVER
+//           (plc\FB_Peralna_Server.scl). Nothing about the laptop goes into the PLC.
+
+const PLC_DEFAULTS = [
+    'plc_mode' => 'server',
+    'plc_listen_ip' => '0.0.0.0',
+    'plc_listen_port' => '502',
+    'plc_allowed_ip' => '',
+    'plc_ip' => '192.168.1.20',
+    'plc_port' => '502',
+    'plc_unit_id' => '1',
+    'plc_poll_ms' => '200',
+    'test_mode' => '0',
+];
+
+function plc_settings(): array
+{
+    $out = [];
+    foreach (PLC_DEFAULTS as $key => $default) {
+        $v = setting($key);
+        $out[$key] = $v === null ? $default : $v;
+    }
+    return $out;
+}
+
+function valid_ipv4(string $ip): bool
+{
+    return filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false;
+}
+
+function valid_port(string $port): bool
+{
+    return ctype_digit($port) && (int)$port >= 1 && (int)$port <= 65535;
+}
+
+/**
+ * Validates and stores the PLC settings. Returns a list of error messages
+ * (empty = saved). Only the fields of the chosen mode are required.
+ */
+function save_plc_settings(array $in): array
+{
+    $mode = ($in['plc_mode'] ?? '') === 'client' ? 'client' : 'server';
+    $v = [
+        'plc_mode' => $mode,
+        'plc_listen_ip' => trim((string)($in['plc_listen_ip'] ?? '')),
+        'plc_listen_port' => trim((string)($in['plc_listen_port'] ?? '')),
+        'plc_allowed_ip' => trim((string)($in['plc_allowed_ip'] ?? '')),
+        'plc_ip' => trim((string)($in['plc_ip'] ?? '')),
+        'plc_port' => trim((string)($in['plc_port'] ?? '')),
+        'plc_unit_id' => trim((string)($in['plc_unit_id'] ?? '')),
+        'plc_poll_ms' => trim((string)($in['plc_poll_ms'] ?? '')),
+        'test_mode' => !empty($in['test_mode']) ? '1' : '0',
+    ];
+    $errors = [];
+    if ($mode === 'server') {
+        if ($v['plc_listen_ip'] === '') $v['plc_listen_ip'] = '0.0.0.0';
+        if (!valid_ipv4($v['plc_listen_ip'])) $errors[] = 'IP адресата на која слуша лаптопот не е валидна (на пример 0.0.0.0 или 192.168.1.10).';
+        if (!valid_port($v['plc_listen_port'])) $errors[] = 'Портата на лаптопот мора да е број од 1 до 65535.';
+        if ($v['plc_allowed_ip'] !== '' && !valid_ipv4($v['plc_allowed_ip'])) $errors[] = 'Дозволената IP адреса на PLC-то не е валидна. Остави ја празна за било која.';
+    } else {
+        if (!valid_ipv4($v['plc_ip']) || $v['plc_ip'] === '0.0.0.0') $errors[] = 'Внеси ја IP адресата на PLC-то (на пример 192.168.1.20).';
+        if (!valid_port($v['plc_port'])) $errors[] = 'Портата на PLC-то мора да е број од 1 до 65535.';
+        if (!ctype_digit($v['plc_unit_id']) || (int)$v['plc_unit_id'] > 255) $errors[] = 'Unit ID мора да е број од 0 до 255.';
+        if (!ctype_digit($v['plc_poll_ms']) || (int)$v['plc_poll_ms'] < 50 || (int)$v['plc_poll_ms'] > 2000) $errors[] = 'Освежувањето мора да е од 50 до 2000 ms.';
+    }
+    if ($errors) return $errors;
+    // Keep the other mode's values as they were, so switching back loses nothing.
+    $keep = $mode === 'server' ? ['plc_ip', 'plc_port', 'plc_unit_id', 'plc_poll_ms'] : ['plc_listen_ip', 'plc_listen_port', 'plc_allowed_ip'];
+    foreach ($v as $key => $value) {
+        if (in_array($key, $keep, true)) continue;
+        setting($key, $value);
+    }
+    return [];
+}
+
+function test_mode(): bool
+{
+    return setting('test_mode') === '1';
+}
+
 // ─── Session, login, CSRF ───────────────────────────────────────
 
 function start_php_session(): void
@@ -437,6 +522,8 @@ function begin_machine_session(string $machineCode, string $uid): array
         }
 
         if ($card['status'] !== 'active') throw new WalletError('Картичката е блокирана.', 'blocked');
+        // The demo card refills itself, so it only works while test mode is on.
+        if ($card['uid'] === DEMO_UID && !test_mode()) throw new WalletError('Демо картичката работи само во тест режим.', 'blocked');
         if ($card['uid'] === DEMO_UID && (int)$card['balance'] < DEMO_BALANCE / 10) {
             $refill = DEMO_BALANCE - (int)$card['balance'];
             $card['balance'] = DEMO_BALANCE;

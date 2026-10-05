@@ -1,7 +1,12 @@
 // Peralna card agent: PC/SC card reader -> billing server (api.php) -> PLC over Modbus TCP.
 // Written for the C# 5 compiler that ships with Windows (.NET Framework 4.x); build.bat compiles it.
 //
-// The PLC is the Modbus client, this program is the server. Holding registers (FC3/FC4, 0-based):
+// Two ways to talk to the S7-1200, chosen on the admin panel page "PLC врска" (plc.php):
+//   server  this program listens, the PLC connects with MB_CLIENT  (plc\FB_Peralna.scl)
+//   client  this program connects to the PLC, which runs MB_SERVER  (plc\FB_Peralna_Server.scl)
+// IP addresses and ports are typed on that page; the agent applies them within seconds.
+//
+// Holding registers (the same map in both modes, 0-based):
 //   0  enable          1 = machine may run, 0 = stop       (also coil 0, FC1)
 //   1  seconds left    on the current balance (max 65535)
 //   2  balance         denars on the card (max 65535)
@@ -20,6 +25,7 @@ using System.Collections.Specialized;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -53,7 +59,10 @@ namespace Peralna
         public bool Simulate = false;
         public int WebPort = 8080;          // 0 = do not start the built-in web server (e.g. under XAMPP)
         public string WebBind = "127.0.0.1";
-        public int VirtualReaderPort = 5021; // CardEmulator.exe add-on; 0 = off
+        public int VirtualReaderPort = 5021; // CardEmulator.exe add-on (only in test mode); 0 = off
+        // PLC link used until the admin panel answers (normally within 2 s). After that the
+        // settings from the "PLC врска" page win.
+        public PlcSettings Plc = new PlcSettings();
 
         public static Config Load(string path)
         {
@@ -71,7 +80,12 @@ namespace Peralna
                     case "machine": c.Machine = val; break;
                     case "server": c.Server = val; break;
                     case "api_key": c.ApiKey = val; break;
-                    case "modbus_port": c.ModbusPort = int.Parse(val); break;
+                    case "modbus_port": c.ModbusPort = int.Parse(val); c.Plc.ListenPort = c.ModbusPort; break;
+                    case "plc_mode": c.Plc.Mode = val.ToLowerInvariant() == "client" ? "client" : "server"; break;
+                    case "plc_listen_ip": c.Plc.ListenIp = val; break;
+                    case "plc_allowed_ip": c.Plc.AllowedIp = val; break;
+                    case "plc_ip": c.Plc.PlcIp = val; break;
+                    case "plc_port": c.Plc.PlcPort = int.Parse(val); break;
                     case "reader": c.Reader = val; break;
                     case "tick_seconds": c.TickSeconds = Math.Max(5, int.Parse(val)); break;
                     case "offline_stop_seconds": c.OfflineStopSeconds = Math.Max(10, int.Parse(val)); break;
@@ -101,6 +115,85 @@ namespace Peralna
         }
     }
 
+    // ─── PLC link settings ───────────────────────────────────────
+
+    class PlcSettings
+    {
+        public string Mode = "server";       // "server" or "client"
+        public string ListenIp = "0.0.0.0";  // server mode: local address to listen on
+        public int ListenPort = 502;
+        public string AllowedIp = "";        // server mode: only this PLC may connect ("" = any)
+        public string PlcIp = "192.168.1.20";// client mode: the PLC's address
+        public int PlcPort = 502;
+        public int UnitId = 1;
+        public int PollMs = 200;
+        public bool TestMode = false;        // emulators and the demo card allowed
+
+        public string Key()
+        {
+            return Mode + "|" + ListenIp + "|" + ListenPort + "|" + AllowedIp + "|" + PlcIp + "|" + PlcPort + "|" + UnitId + "|" + PollMs + "|" + TestMode;
+        }
+
+        public string LinkKey()
+        {
+            // Test mode only matters to the server's loopback rule, not to the client.
+            return Mode == "client" ? Mode + "|" + PlcIp + "|" + PlcPort + "|" + UnitId + "|" + PollMs : Key();
+        }
+
+        public string Describe()
+        {
+            return Mode == "client"
+                ? "Лаптоп → PLC " + PlcIp + ":" + PlcPort
+                : "Лаптопот слуша на " + ListenIp + ":" + ListenPort + (AllowedIp.Length > 0 ? " (само " + AllowedIp + ")" : "");
+        }
+
+        public PlcSettings Clone() { return (PlcSettings)MemberwiseClone(); }
+
+        static int Num(Dictionary<string, object> d, string key, int fallback, int min, int max)
+        {
+            object v;
+            int n;
+            if (d.TryGetValue(key, out v) && v != null && int.TryParse(v.ToString(), out n) && n >= min && n <= max) return n;
+            return fallback;
+        }
+
+        static string Ip(Dictionary<string, object> d, string key, string fallback, bool allowEmpty)
+        {
+            object v;
+            if (!d.TryGetValue(key, out v) || v == null) return fallback;
+            string s = v.ToString().Trim();
+            IPAddress ip;
+            if (s.Length == 0) return allowEmpty ? "" : fallback;
+            return IPAddress.TryParse(s, out ip) && ip.AddressFamily == AddressFamily.InterNetwork ? s : fallback;
+        }
+
+        // Settings from the admin panel (api.php status reply). Anything invalid keeps the old value.
+        public static PlcSettings FromServer(Dictionary<string, object> d, PlcSettings old)
+        {
+            PlcSettings p = old.Clone();
+            object v;
+            if (d.TryGetValue("plc_mode", out v) && v != null) p.Mode = v.ToString() == "client" ? "client" : "server";
+            p.ListenIp = Ip(d, "plc_listen_ip", p.ListenIp, false);
+            p.ListenPort = Num(d, "plc_listen_port", p.ListenPort, 1, 65535);
+            p.AllowedIp = Ip(d, "plc_allowed_ip", p.AllowedIp, true);
+            p.PlcIp = Ip(d, "plc_ip", p.PlcIp, false);
+            p.PlcPort = Num(d, "plc_port", p.PlcPort, 1, 65535);
+            p.UnitId = Num(d, "plc_unit_id", p.UnitId, 0, 255);
+            p.PollMs = Num(d, "plc_poll_ms", p.PollMs, 50, 2000);
+            if (d.TryGetValue("test_mode", out v) && v != null) p.TestMode = v.ToString() == "1";
+            return p;
+        }
+    }
+
+    interface IPlcLink
+    {
+        void Start();
+        void Stop();
+        bool Connected { get; }   // a successful exchange within the last 5 s
+        string Peer { get; }      // address of the PLC
+        string Error { get; }     // why it is not connected, in Macedonian ("" = no problem)
+    }
+
     // ─── Shared register table ───────────────────────────────────
 
     class Registers
@@ -125,46 +218,131 @@ namespace Peralna
         public bool WritableByPlc(int start, int count) { return start >= 10 && start + count <= 20; }
     }
 
-    // ─── Modbus TCP server (the PLC is the client) ───────────────
+    // ─── Modbus TCP framing shared by the server and the client ──
 
-    class ModbusServer
+    static class Modbus
     {
-        // When the PLC last asked for data, and from where. Read by the status report.
-        public static long LastRequestTicks;
-        public static string LastPeer = "";
-
-        public static bool PlcConnected()
+        public static bool ReadExact(Stream s, byte[] buf, int count)
         {
-            long ticks = Interlocked.Read(ref LastRequestTicks);
-            return ticks > 0 && (DateTime.UtcNow - new DateTime(ticks)).TotalSeconds < 5;
+            int got = 0;
+            while (got < count)
+            {
+                int n = s.Read(buf, got, count - got);
+                if (n <= 0) return false;
+                got += n;
+            }
+            return true;
         }
 
-        readonly Registers regs;
-        readonly int port;
+        public static string SocketReason(SocketException ex)
+        {
+            switch (ex.SocketErrorCode)
+            {
+                case SocketError.ConnectionRefused: return "PLC-то не слуша на таа порта (провери ја портата и дали програмата е симната во PLC-то)";
+                case SocketError.TimedOut: return "PLC-то не одговара (провери кабел, IP адреса и маска)";
+                case SocketError.HostUnreachable:
+                case SocketError.NetworkUnreachable: return "лаптопот нема мрежа до таа адреса (провери IP на лаптопот и маската)";
+                case SocketError.AddressAlreadyInUse: return "портата е зафатена од друга програма";
+                case SocketError.AddressNotAvailable: return "лаптопот ја нема таа IP адреса";
+                case SocketError.AccessDenied: return "Windows не дозволува таа порта (пробај 502 или стартувај како администратор)";
+                case SocketError.ConnectionReset: return "PLC-то ја прекина врската";
+                default: return ex.Message;
+            }
+        }
+    }
 
-        public ModbusServer(Registers regs, int port) { this.regs = regs; this.port = port; }
+    // ─── Modbus TCP server (the PLC is the client) ───────────────
+
+    class ModbusServer : IPlcLink
+    {
+        long lastRequestTicks;
+        volatile string peer = "";
+        volatile string error = "";
+        volatile bool stopped;
+        TcpListener listener;
+        readonly List<TcpClient> clients = new List<TcpClient>();
+
+        readonly Registers regs;
+        readonly PlcSettings cfg;
+
+        public ModbusServer(Registers regs, PlcSettings cfg) { this.regs = regs; this.cfg = cfg; }
+
+        public bool Connected
+        {
+            get
+            {
+                long ticks = Interlocked.Read(ref lastRequestTicks);
+                return ticks > 0 && (DateTime.UtcNow - new DateTime(ticks)).TotalSeconds < 5;
+            }
+        }
+        public string Peer { get { return peer; } }
+        public string Error
+        {
+            get
+            {
+                if (error.Length > 0 || Connected) return error;
+                return "Чекам PLC-то да се поврзе на " + cfg.ListenIp + ":" + cfg.ListenPort;
+            }
+        }
 
         public void Start()
         {
-            TcpListener listener = new TcpListener(IPAddress.Any, port);
-            listener.Start();
-            Log.Write("Modbus TCP server listening on port " + port);
-            Thread t = new Thread(delegate ()
-            {
-                while (true)
-                {
-                    TcpClient client = listener.AcceptTcpClient();
-                    Log.Write("PLC connected from " + client.Client.RemoteEndPoint);
-                    Thread h = new Thread(delegate () { Serve(client); });
-                    h.IsBackground = true;
-                    h.Start();
-                }
-            });
+            Thread t = new Thread(Listen);
             t.IsBackground = true;
             t.Start();
         }
 
-        void Serve(TcpClient client)
+        public void Stop()
+        {
+            stopped = true;
+            try { if (listener != null) listener.Stop(); } catch { }
+            lock (clients) { foreach (TcpClient c in clients) { try { c.Close(); } catch { } } clients.Clear(); }
+        }
+
+        void Listen()
+        {
+            // Retry until the port can be opened (e.g. another program still holds it).
+            while (!stopped)
+            {
+                try
+                {
+                    listener = new TcpListener(IPAddress.Parse(cfg.ListenIp), cfg.ListenPort);
+                    listener.Start();
+                    error = "";
+                    Log.Write("Modbus TCP server listening on " + cfg.ListenIp + ":" + cfg.ListenPort
+                        + (cfg.AllowedIp.Length > 0 ? " (only " + cfg.AllowedIp + ")" : ""));
+                    break;
+                }
+                catch (SocketException ex)
+                {
+                    error = "Не може да се отвори " + cfg.ListenIp + ":" + cfg.ListenPort + ": " + Modbus.SocketReason(ex);
+                    Log.Write(error);
+                    for (int i = 0; i < 50 && !stopped; i++) Thread.Sleep(100);
+                }
+            }
+            while (!stopped)
+            {
+                TcpClient client;
+                try { client = listener.AcceptTcpClient(); }
+                catch (Exception) { if (stopped) return; Thread.Sleep(500); continue; }
+                string from = ((IPEndPoint)client.Client.RemoteEndPoint).Address.ToString();
+                bool loopback = from == "127.0.0.1";
+                if (cfg.AllowedIp.Length > 0 && from != cfg.AllowedIp && !(loopback && cfg.TestMode))
+                {
+                    error = "Одбиена врска од " + from + ": дозволено е само PLC " + cfg.AllowedIp;
+                    Log.Write(error);
+                    client.Close();
+                    continue;
+                }
+                Log.Write("PLC connected from " + client.Client.RemoteEndPoint);
+                lock (clients) clients.Add(client);
+                Thread h = new Thread(delegate () { Serve(client, from); });
+                h.IsBackground = true;
+                h.Start();
+            }
+        }
+
+        void Serve(TcpClient client, string from)
         {
             try
             {
@@ -172,15 +350,15 @@ namespace Peralna
                 using (NetworkStream s = client.GetStream())
                 {
                     byte[] header = new byte[7];
-                    string peer = ((IPEndPoint)client.Client.RemoteEndPoint).Address.ToString();
-                    while (ReadExact(s, header, 7))
+                    while (!stopped && Modbus.ReadExact(s, header, 7))
                     {
-                        Interlocked.Exchange(ref LastRequestTicks, DateTime.UtcNow.Ticks);
-                        LastPeer = peer;
+                        Interlocked.Exchange(ref lastRequestTicks, DateTime.UtcNow.Ticks);
+                        peer = from;
+                        error = "";
                         int length = (header[4] << 8) | header[5];
                         if (length < 2 || length > 260) return;
                         byte[] pdu = new byte[length - 1];
-                        if (!ReadExact(s, pdu, pdu.Length)) return;
+                        if (!Modbus.ReadExact(s, pdu, pdu.Length)) return;
                         byte[] reply = Handle(pdu);
                         byte[] frame = new byte[7 + reply.Length];
                         Array.Copy(header, frame, 4);            // transaction id + protocol id
@@ -193,27 +371,16 @@ namespace Peralna
                 }
             }
             catch (Exception) { }
-            Log.Write("PLC disconnected");
+            lock (clients) clients.Remove(client);
+            if (!stopped) Log.Write("PLC disconnected");
         }
 
-        static bool ReadExact(Stream s, byte[] buf, int count)
-        {
-            int got = 0;
-            while (got < count)
-            {
-                int n = s.Read(buf, got, count - got);
-                if (n <= 0) return false;
-                got += n;
-            }
-            return true;
-        }
-
-        static byte[] Error(byte fc, byte code) { return new byte[] { (byte)(fc | 0x80), code }; }
+        static byte[] Fail(byte fc, byte code) { return new byte[] { (byte)(fc | 0x80), code }; }
 
         byte[] Handle(byte[] pdu)
         {
             byte fc = pdu[0];
-            if (pdu.Length < 5) return Error(fc, 3);
+            if (pdu.Length < 5) return Fail(fc, 3);
             int addr = (pdu[1] << 8) | pdu[2];
             int qty = (pdu[3] << 8) | pdu[4];
             switch (fc)
@@ -221,7 +388,7 @@ namespace Peralna
                 case 1: // read coils: coil 0 mirrors register 0 (enable)
                 case 2:
                 {
-                    if (qty < 1 || qty > 2000 || addr + qty > 100) return Error(fc, 2);
+                    if (qty < 1 || qty > 2000 || addr + qty > 100) return Fail(fc, 2);
                     byte[] bits = new byte[(qty + 7) / 8];
                     for (int i = 0; i < qty; i++)
                         if (regs.Get(addr + i) != 0 && addr + i == 0) bits[i / 8] |= (byte)(1 << (i % 8));
@@ -233,7 +400,7 @@ namespace Peralna
                 case 3:
                 case 4:
                 {
-                    if (qty < 1 || qty > 125 || addr + qty > 100) return Error(fc, 2);
+                    if (qty < 1 || qty > 125 || addr + qty > 100) return Fail(fc, 2);
                     ushort[] v = regs.Snapshot(addr, qty);
                     byte[] r = new byte[2 + qty * 2];
                     r[0] = fc; r[1] = (byte)(qty * 2);
@@ -242,19 +409,170 @@ namespace Peralna
                 }
                 case 6:
                 {
-                    if (!regs.WritableByPlc(addr, 1)) return Error(fc, 2);
+                    if (!regs.WritableByPlc(addr, 1)) return Fail(fc, 2);
                     regs.Set(addr, qty); // for FC6 the "qty" field holds the value
                     return (byte[])pdu.Clone();
                 }
                 case 16:
                 {
-                    if (pdu.Length < 6 + qty * 2 || !regs.WritableByPlc(addr, qty)) return Error(fc, 2);
+                    if (pdu.Length < 6 + qty * 2 || !regs.WritableByPlc(addr, qty)) return Fail(fc, 2);
                     for (int i = 0; i < qty; i++) regs.Set(addr + i, (pdu[6 + i * 2] << 8) | pdu[7 + i * 2]);
                     return new byte[] { fc, pdu[1], pdu[2], pdu[3], pdu[4] };
                 }
                 default:
-                    return Error(fc, 1);
+                    return Fail(fc, 1);
             }
+        }
+    }
+
+    // ─── Modbus TCP client (the PLC is the server, MB_SERVER) ────
+    //
+    // Every PollMs: write registers 0..9 and 20..52 to the PLC (FC16), then read 10..19 back
+    // (FC3). Registers 10..19 belong to the PLC and are never written from here, so the
+    // program the bay chose (register 10) cannot be overwritten.
+
+    class ModbusClient : IPlcLink
+    {
+        long lastOkTicks;
+        volatile string error = "";
+        volatile bool stopped;
+        TcpClient tcp;
+        ushort transaction;
+
+        readonly Registers regs;
+        readonly PlcSettings cfg;
+
+        public ModbusClient(Registers regs, PlcSettings cfg) { this.regs = regs; this.cfg = cfg; }
+
+        public bool Connected
+        {
+            get
+            {
+                long ticks = Interlocked.Read(ref lastOkTicks);
+                return ticks > 0 && (DateTime.UtcNow - new DateTime(ticks)).TotalSeconds < 5;
+            }
+        }
+        public string Peer { get { return cfg.PlcIp + ":" + cfg.PlcPort; } }
+        public string Error { get { return error; } }
+
+        public void Start()
+        {
+            Thread t = new Thread(Loop);
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        public void Stop()
+        {
+            stopped = true;
+            Close();
+        }
+
+        void Close()
+        {
+            try { if (tcp != null) tcp.Close(); } catch { }
+            tcp = null;
+        }
+
+        void Loop()
+        {
+            bool wasConnected = false;
+            while (!stopped)
+            {
+                try
+                {
+                    tcp = new TcpClient();
+                    IAsyncResult r = tcp.BeginConnect(IPAddress.Parse(cfg.PlcIp), cfg.PlcPort, null, null);
+                    if (!r.AsyncWaitHandle.WaitOne(3000)) throw new SocketException((int)SocketError.TimedOut);
+                    tcp.EndConnect(r);   // throws the real reason (e.g. connection refused)
+                    tcp.NoDelay = true;
+                    NetworkStream s = tcp.GetStream();
+                    s.ReadTimeout = 2000;
+                    s.WriteTimeout = 2000;
+                    Log.Write("Connected to PLC " + Peer);
+                    while (!stopped)
+                    {
+                        Exchange(s);
+                        Interlocked.Exchange(ref lastOkTicks, DateTime.UtcNow.Ticks);
+                        if (!wasConnected) { wasConnected = true; error = ""; }
+                        Thread.Sleep(cfg.PollMs);
+                    }
+                }
+                catch (SocketException ex) { Fail("Нема врска со PLC " + Peer + ": " + Modbus.SocketReason(ex)); }
+                catch (IOException ex)
+                {
+                    SocketException se = ex.InnerException as SocketException;
+                    Fail("Врската со PLC " + Peer + " падна: " + (se != null ? Modbus.SocketReason(se) : ex.Message));
+                }
+                catch (Exception ex) { Fail("PLC " + Peer + ": " + ex.Message); }
+                if (wasConnected && !stopped) Log.Write("PLC disconnected");
+                wasConnected = false;
+                Close();
+                for (int i = 0; i < 20 && !stopped; i++) Thread.Sleep(100);   // retry every 2 s
+            }
+        }
+
+        void Fail(string message)
+        {
+            if (stopped) return;
+            if (message != error) Log.Write(message);
+            error = message;
+        }
+
+        void Exchange(NetworkStream s)
+        {
+            WriteBlock(s, 0, regs.Snapshot(0, 10));
+            WriteBlock(s, 20, regs.Snapshot(20, 33));
+            ushort[] back = ReadBlock(s, 10, 10);
+            for (int i = 0; i < back.Length; i++) regs.Set(10 + i, back[i]);
+        }
+
+        byte[] Request(NetworkStream s, byte[] pdu)
+        {
+            transaction++;
+            byte[] frame = new byte[7 + pdu.Length];
+            frame[0] = (byte)(transaction >> 8); frame[1] = (byte)transaction;
+            frame[4] = (byte)((pdu.Length + 1) >> 8); frame[5] = (byte)((pdu.Length + 1) & 0xFF);
+            frame[6] = (byte)cfg.UnitId;
+            Array.Copy(pdu, 0, frame, 7, pdu.Length);
+            s.Write(frame, 0, frame.Length);
+
+            byte[] header = new byte[7];
+            if (!Modbus.ReadExact(s, header, 7)) throw new IOException("PLC-то ја затвори врската");
+            int length = (header[4] << 8) | header[5];
+            if (length < 2 || length > 260) throw new IOException("неисправен Modbus одговор");
+            byte[] reply = new byte[length - 1];
+            if (!Modbus.ReadExact(s, reply, reply.Length)) throw new IOException("PLC-то ја затвори врската");
+            if (header[0] != frame[0] || header[1] != frame[1]) throw new IOException("Modbus одговорот е за друго барање");
+            if ((reply[0] & 0x80) != 0)
+            {
+                int code = reply.Length > 1 ? reply[1] : 0;
+                throw new Exception(code == 2
+                    ? "PLC-то ја одби адресата: MB_HOLD_REG во PLC-то мора да има најмалку 53 регистри (Array[0..52] of Word)"
+                    : "PLC-то врати Modbus грешка " + code);
+            }
+            if (reply[0] != pdu[0]) throw new IOException("неочекуван Modbus одговор");
+            return reply;
+        }
+
+        void WriteBlock(NetworkStream s, int addr, ushort[] values)
+        {
+            byte[] pdu = new byte[6 + values.Length * 2];
+            pdu[0] = 16;
+            pdu[1] = (byte)(addr >> 8); pdu[2] = (byte)addr;
+            pdu[3] = (byte)(values.Length >> 8); pdu[4] = (byte)values.Length;
+            pdu[5] = (byte)(values.Length * 2);
+            for (int i = 0; i < values.Length; i++) { pdu[6 + i * 2] = (byte)(values[i] >> 8); pdu[7 + i * 2] = (byte)values[i]; }
+            Request(s, pdu);
+        }
+
+        ushort[] ReadBlock(NetworkStream s, int addr, int qty)
+        {
+            byte[] reply = Request(s, new byte[] { 3, (byte)(addr >> 8), (byte)addr, (byte)(qty >> 8), (byte)qty });
+            if (reply.Length < 2 + qty * 2) throw new IOException("прекраток Modbus одговор");
+            ushort[] v = new ushort[qty];
+            for (int i = 0; i < qty; i++) v[i] = (ushort)((reply[2 + i * 2] << 8) | reply[3 + i * 2]);
+            return v;
         }
     }
 
@@ -337,17 +655,33 @@ namespace Peralna
         StreamWriter writer;
         public volatile bool Connected;
         public string Name = "";
+        TcpListener listener;
+        TcpClient current;
+        public bool Running { get { return listener != null; } }
 
+        // Only while test mode is on (admin panel → PLC врска).
         public void Start(int port)
         {
-            TcpListener listener = new TcpListener(IPAddress.Loopback, port);
-            listener.Start();
-            Log.Write("Virtual card reader port " + port + " (CardEmulator.exe)");
+            if (listener != null) return;
+            try
+            {
+                listener = new TcpListener(IPAddress.Loopback, port);
+                listener.Start();
+            }
+            catch (Exception ex)
+            {
+                Log.Write("Virtual card reader port " + port + " not available: " + ex.Message);
+                listener = null;
+                return;
+            }
+            Log.Write("Test mode: virtual card reader on port " + port + " (CardEmulator.exe)");
+            TcpListener own = listener;
             Thread t = new Thread(delegate ()
             {
                 while (true)
                 {
-                    TcpClient client = listener.AcceptTcpClient();
+                    TcpClient client;
+                    try { client = own.AcceptTcpClient(); } catch { return; }   // stopped
                     Thread h = new Thread(delegate () { Serve(client); });
                     h.IsBackground = true;
                     h.Start();
@@ -357,8 +691,18 @@ namespace Peralna
             t.Start();
         }
 
+        public void Stop()
+        {
+            if (listener == null) return;
+            try { listener.Stop(); } catch { }
+            listener = null;
+            lock (gate) { try { if (current != null) current.Close(); } catch { } }
+            Log.Write("Test mode off: virtual card reader closed");
+        }
+
         void Serve(TcpClient client)
         {
+            lock (gate) current = client;
             try
             {
                 using (client)
@@ -551,8 +895,50 @@ namespace Peralna
         bool simActive;     // the card came from the virtual reader (CardEmulator.exe)
         bool spraying;      // last state sent to the server: foam or water on
         readonly VirtualReader virtualReader = new VirtualReader();
+        PlcSettings plc;
+        IPlcLink link;
 
         public Agent(Config cfg) { this.cfg = cfg; api = new Api(cfg); }
+
+        // Starts the PLC link, or swaps it when the settings on the admin panel change.
+        void ApplyPlc(PlcSettings next)
+        {
+            bool linkChanged = plc == null || plc.LinkKey() != next.LinkKey();
+            bool testChanged = plc == null || plc.TestMode != next.TestMode;
+            if (linkChanged)
+            {
+                if (link != null)
+                {
+                    Log.Write("PLC settings changed: " + next.Describe());
+                    link.Stop();
+                }
+                link = next.Mode == "client" ? (IPlcLink)new ModbusClient(regs, next) : new ModbusServer(regs, next);
+                if (next.Mode == "client") Log.Write("PLC link: " + next.Describe() + ", every " + next.PollMs + " ms, unit " + next.UnitId);
+                link.Start();
+            }
+            if (testChanged)
+            {
+                if (next.TestMode && cfg.VirtualReaderPort > 0) virtualReader.Start(cfg.VirtualReaderPort);
+                else virtualReader.Stop();
+            }
+            plc = next;
+        }
+
+        static string LocalIps()
+        {
+            List<string> ips = new List<string>();
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up || ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    foreach (UnicastIPAddressInformation a in ni.GetIPProperties().UnicastAddresses)
+                        if (a.Address.AddressFamily == AddressFamily.InterNetwork && !ips.Contains(a.Address.ToString())) ips.Add(a.Address.ToString());
+                }
+            }
+            catch { }
+            return string.Join(",", ips.ToArray());
+        }
 
         static int Int(Dictionary<string, object> r, string key)
         {
@@ -600,11 +986,11 @@ namespace Peralna
 
         public void Run()
         {
-            new ModbusServer(regs, cfg.ModbusPort).Start();
-            if (cfg.VirtualReaderPort > 0) virtualReader.Start(cfg.VirtualReaderPort);
+            ApplyPlc(cfg.Plc.Clone());       // from agent.ini until the admin panel answers
             Show(Status.NoReader, false);
             Dictionary<string, object> ping = api.Call("ping", new NameValueCollection());
             Log.Write(ping != null && Bool(ping, "ok") ? "Billing server OK: " + cfg.Server : "Billing server NOT reachable: " + cfg.Server);
+            SendStatus();                    // picks up the PLC settings from the admin panel
 
             if (cfg.Simulate)
             {
@@ -817,9 +1203,24 @@ namespace Peralna
                 readerName = readerName.Length > 0 ? readerName + " + виртуелен" : "Виртуелен читач (" + virtualReader.Name + ")";
             f["reader"] = readerName;
             f["card"] = cardPresent ? "1" : "0";
-            f["plc"] = ModbusServer.PlcConnected() ? "1" : "0";
-            f["plc_peer"] = ModbusServer.LastPeer;
-            api.Call("status", f);
+            f["plc"] = link.Connected ? "1" : "0";
+            f["plc_peer"] = link.Peer;
+            f["plc_link"] = plc.Describe();
+            f["plc_error"] = link.Connected ? "" : link.Error;
+            f["local_ips"] = LocalIps();
+            f["version"] = Program.Version;
+            // What this agent runs now; the admin panel takes it over the first time, so an
+            // upgraded install keeps the port from its old agent.ini.
+            f["cur_mode"] = plc.Mode;
+            f["cur_listen_ip"] = plc.ListenIp;
+            f["cur_listen_port"] = plc.ListenPort.ToString();
+            f["cur_allowed_ip"] = plc.AllowedIp;
+            f["cur_plc_ip"] = plc.PlcIp;
+            f["cur_plc_port"] = plc.PlcPort.ToString();
+            Dictionary<string, object> r = api.Call("status", f);
+            object conf;
+            if (r != null && r.TryGetValue("config", out conf) && conf is Dictionary<string, object>)
+                ApplyPlc(PlcSettings.FromServer((Dictionary<string, object>)conf, plc));
         }
 
         void EverySecond()
@@ -839,7 +1240,7 @@ namespace Peralna
 
             // Foam or water is on: the PLC writes its program to register 10. A stale value from a
             // PLC that has gone away does not count.
-            bool nowSpraying = regs.Get(0) == 1 && regs.Get(10) != 0 && ModbusServer.PlcConnected();
+            bool nowSpraying = regs.Get(0) == 1 && regs.Get(10) != 0 && link.Connected;
             bool changed = nowSpraying != spraying;
             if (nowSpraying)
             {
@@ -883,6 +1284,8 @@ namespace Peralna
 
     static class Program
     {
+        public const string Version = "1.3.0";
+
         static void Main(string[] args)
         {
             string dir = AppDomain.CurrentDomain.BaseDirectory;
@@ -890,7 +1293,7 @@ namespace Peralna
             Config cfg = Config.Load(Path.Combine(dir, args.Length > 0 ? args[0] : "agent.ini"));
             Console.Title = "Автоперална Павлинка - агент";
             Console.OutputEncoding = Encoding.UTF8;
-            Log.Write("Avtoperalna Pavlinka agent - machine " + cfg.Machine + ", server " + cfg.Server);
+            Log.Write("Avtoperalna Pavlinka agent " + Version + " - machine " + cfg.Machine + ", server " + cfg.Server);
             if (cfg.WebPort > 0) WebServer.Start(dir, cfg);
             new Agent(cfg).Run();
         }

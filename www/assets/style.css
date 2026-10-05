@@ -114,3 +114,21 @@ tr.clickable:hover { background: #f8fafc; }
 .link-status small.card-in { color: var(--brand); font-weight: 600; }
 .topbar .brand { display: inline-flex; align-items: center; gap: 8px; }
 .topbar .logo { width: 26px; height: 26px; border-radius: 6px; }
+
+/* PLC link page */
+.plc-live { border-left: 6px solid var(--bad); }
+.plc-live.on { border-left-color: var(--good); }
+.plc-error { color: var(--bad); font-size: 13px; margin-top: 4px; }
+.small { font-size: 13px; }
+.mode-pick { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.mode-option { flex-direction: row; align-items: flex-start; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; color: var(--ink); font-size: 15px; }
+.mode-option:has(input:checked) { border-color: var(--brand); background: var(--run); }
+.mode-option input { width: auto; margin-top: 4px; }
+.mode-option small { display: block; color: var(--muted); font-size: 13px; margin-top: 2px; }
+.mode-fields { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px 4px; margin: 0 0 16px; }
+.mode-fields legend { font-weight: 600; padding: 0 6px; }
+.mode-fields small { font-size: 12px; }
+.plc-form h2 { margin-top: 8px; }
+.mode-fields .grid { align-items: start; }
+label.check input { width: auto; }
+.plc-form label.check { font-size: 15px; color: var(--ink); }

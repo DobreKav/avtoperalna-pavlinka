@@ -17,9 +17,11 @@ namespace PeralnaSetup
     static class Product
     {
         public const string Name = "Автоперална Павлинка";
-        public const string Version = "1.2.0";
+        public const string Version = "1.3.0";
         public const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\AvtoperalnaPavlinka";
-        public const string FirewallRule = "Avtoperalna Pavlinka - PLC Modbus 502";
+        // Allows the agent itself (any port chosen on the "PLC врска" page), not just port 502.
+        public const string FirewallRule = "Avtoperalna Pavlinka - PLC Modbus";
+        public const string LegacyFirewallRule = "Avtoperalna Pavlinka - PLC Modbus 502";   // 1.0-1.2
         public const string AdminUrl = "http://localhost:8080/";
 
         public static string Menu { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms), Name); } }
@@ -29,6 +31,7 @@ namespace PeralnaSetup
         public static string AdminLinkName { get { return Name + " — админ панел.url"; } }
         public const string CardEmuLinkName = "Емулатор — читач на картички.lnk";
         public const string PlcEmuLinkName = "Емулатор — PLC S7-1200.lnk";
+        public static readonly string[] EmulatorFiles = { "CardEmulator.exe", "PlcEmulator.exe" };
     }
 
     class SetupForm : Form
@@ -37,6 +40,7 @@ namespace PeralnaSetup
         readonly CheckBox autoStart = new CheckBox();
         readonly CheckBox desktop = new CheckBox();
         readonly CheckBox firewall = new CheckBox();
+        readonly CheckBox emulators = new CheckBox();
         readonly Button install = new Button();
         readonly Button cancel = new Button();
         readonly Label status = new Label();
@@ -50,7 +54,7 @@ namespace PeralnaSetup
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(520, 330);
+            ClientSize = new Size(520, 360);
 
             Label title = new Label();
             title.Text = Product.Name;
@@ -84,23 +88,27 @@ namespace PeralnaSetup
             desktop.Text = "Икони на Desktop";
             desktop.Checked = true;
             desktop.SetBounds(20, 192, 480, 24);
-            firewall.Text = "Дозволи PLC врска во Windows Firewall (порта 502)";
+            firewall.Text = "Дозволи PLC врска во Windows Firewall";
             firewall.Checked = true;
             firewall.SetBounds(20, 218, 480, 24);
+            // Off for a real bay: the emulators are only for trying the system without hardware.
+            emulators.Text = "Тест додатоци: емулатори за читач и PLC (не за работа)";
+            emulators.Checked = false;
+            emulators.SetBounds(20, 244, 480, 24);
 
-            progress.SetBounds(20, 252, 480, 14);
-            status.SetBounds(20, 270, 480, 22);
+            progress.SetBounds(20, 280, 480, 14);
+            status.SetBounds(20, 298, 480, 22);
             status.ForeColor = Color.DimGray;
 
             install.Text = "Инсталирај";
-            install.SetBounds(300, 290, 110, 32);
+            install.SetBounds(300, 320, 110, 32);
             install.Click += delegate { RunInstall(); };
             cancel.Text = "Откажи";
-            cancel.SetBounds(418, 290, 82, 32);
+            cancel.SetBounds(418, 320, 82, 32);
             cancel.Click += delegate { Close(); };
             AcceptButton = install;
 
-            Controls.AddRange(new Control[] { title, info, dirLabel, dirBox, browse, autoStart, desktop, firewall, progress, status, install, cancel });
+            Controls.AddRange(new Control[] { title, info, dirLabel, dirBox, browse, autoStart, desktop, firewall, emulators, progress, status, install, cancel });
 
             string existing = ExistingInstallDir();
             if (existing != null)
@@ -152,23 +160,31 @@ namespace PeralnaSetup
                 Shortcut(Path.Combine(Product.Menu, Product.AgentLinkName), agent, "", dir, agent, 1);
                 UrlShortcut(Path.Combine(Product.Menu, Product.AdminLinkName), Product.AdminUrl, agent);
                 Shortcut(Path.Combine(Product.Menu, "Деинсталирај.lnk"), uninstaller, "/uninstall", dir, agent, 1);
-                Shortcut(Path.Combine(Product.Menu, Product.CardEmuLinkName), Path.Combine(dir, "CardEmulator.exe"), "", dir, Path.Combine(dir, "CardEmulator.exe"), 1);
-                Shortcut(Path.Combine(Product.Menu, Product.PlcEmuLinkName), Path.Combine(dir, "PlcEmulator.exe"), "", dir, Path.Combine(dir, "PlcEmulator.exe"), 1);
+                if (emulators.Checked)
+                {
+                    Shortcut(Path.Combine(Product.Menu, Product.CardEmuLinkName), Path.Combine(dir, "CardEmulator.exe"), "", dir, Path.Combine(dir, "CardEmulator.exe"), 1);
+                    Shortcut(Path.Combine(Product.Menu, Product.PlcEmuLinkName), Path.Combine(dir, "PlcEmulator.exe"), "", dir, Path.Combine(dir, "PlcEmulator.exe"), 1);
+                }
+                else RemoveEmulators(dir);
                 if (autoStart.Checked) Shortcut(Product.StartupLink, agent, "", dir, agent, 7);
                 else if (File.Exists(Product.StartupLink)) File.Delete(Product.StartupLink);
                 if (desktop.Checked)
                 {
                     Shortcut(Path.Combine(Product.Desktop, Product.AgentLinkName), agent, "", dir, agent, 1);
                     UrlShortcut(Path.Combine(Product.Desktop, Product.AdminLinkName), Product.AdminUrl, agent);
-                    Shortcut(Path.Combine(Product.Desktop, Product.CardEmuLinkName), Path.Combine(dir, "CardEmulator.exe"), "", dir, Path.Combine(dir, "CardEmulator.exe"), 1);
-                    Shortcut(Path.Combine(Product.Desktop, Product.PlcEmuLinkName), Path.Combine(dir, "PlcEmulator.exe"), "", dir, Path.Combine(dir, "PlcEmulator.exe"), 1);
+                    if (emulators.Checked)
+                    {
+                        Shortcut(Path.Combine(Product.Desktop, Product.CardEmuLinkName), Path.Combine(dir, "CardEmulator.exe"), "", dir, Path.Combine(dir, "CardEmulator.exe"), 1);
+                        Shortcut(Path.Combine(Product.Desktop, Product.PlcEmuLinkName), Path.Combine(dir, "PlcEmulator.exe"), "", dir, Path.Combine(dir, "PlcEmulator.exe"), 1);
+                    }
                 }
 
                 if (firewall.Checked)
                 {
                     Step("Firewall правило за PLC…", 85);
+                    Run("netsh", "advfirewall firewall delete rule name=\"" + Product.LegacyFirewallRule + "\"");
                     Run("netsh", "advfirewall firewall delete rule name=\"" + Product.FirewallRule + "\"");
-                    Run("netsh", "advfirewall firewall add rule name=\"" + Product.FirewallRule + "\" dir=in action=allow protocol=TCP localport=502");
+                    Run("netsh", "advfirewall firewall add rule name=\"" + Product.FirewallRule + "\" dir=in action=allow protocol=TCP program=\"" + agent + "\" enable=yes");
                 }
 
                 Step("Регистрирам ја програмата…", 92);
@@ -196,7 +212,7 @@ namespace PeralnaSetup
                 Step("Готово.", 100);
                 MessageBox.Show(this,
                     "Инсталацијата заврши.\n\nАдмин панел: " + Product.AdminUrl + "\n\nПрв пат направи админ корисник. " +
-                    "Во " + Path.Combine(dir, "agent.ini") + " може да се менуваат поставките на читачот.",
+                    "IP адресите и портите за PLC-то се внесуваат во админ панелот → PLC врска.",
                     Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
                 Close();
             }
@@ -206,6 +222,17 @@ namespace PeralnaSetup
                 MessageBox.Show(this, "Инсталацијата не успеа:\n\n" + ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 install.Enabled = cancel.Enabled = dirBox.Enabled = true;
             }
+        }
+
+        // A production install has no emulators: remove them and their shortcuts if an older
+        // version put them there.
+        static void RemoveEmulators(string dir)
+        {
+            foreach (string f in Product.EmulatorFiles)
+                try { File.Delete(Path.Combine(dir, f)); } catch { }
+            foreach (string folder in new[] { Product.Menu, Product.Desktop })
+                foreach (string link in new[] { Product.CardEmuLinkName, Product.PlcEmuLinkName })
+                    try { File.Delete(Path.Combine(folder, link)); } catch { }
         }
 
         public static void StopRunning(string dir)
@@ -255,6 +282,7 @@ namespace PeralnaSetup
                         continue;
                     }
                     if (File.Exists(target) && KeepExisting(entry.FullName)) continue;
+                    if (!emulators.Checked && Array.IndexOf(Product.EmulatorFiles, entry.FullName) >= 0) continue;
                     Directory.CreateDirectory(Path.GetDirectoryName(target));
                     entry.ExtractToFile(target, true);
                 }
@@ -326,6 +354,7 @@ namespace PeralnaSetup
 
             SetupForm.StopRunning(dir);
             SetupForm.Run("netsh", "advfirewall firewall delete rule name=\"" + Product.FirewallRule + "\"");
+            SetupForm.Run("netsh", "advfirewall firewall delete rule name=\"" + Product.LegacyFirewallRule + "\"");
             foreach (string f in new[] {
                 Product.StartupLink,
                 Path.Combine(Product.Desktop, Product.AgentLinkName),

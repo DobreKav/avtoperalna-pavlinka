@@ -130,6 +130,10 @@ check('card out after the pause: 10 den in total', $done['charged'], 10);
 // Demo card: exists after setup and refills itself when low.
 $demo = find_card_by_uid(DEMO_UID);
 check('demo card exists', $demo !== null && $demo['holder_name'] === 'Демо картичка', true);
+check('demo card refused outside test mode', reason(function () {
+    begin_machine_session('W2', DEMO_UID);
+}), 'blocked');
+setting('test_mode', '1');
 db()->prepare('UPDATE cards SET balance = 30 WHERE uid = ?')->execute([DEMO_UID]);
 $d = begin_machine_session('W2', DEMO_UID);
 check('demo card refills to 1000 and starts', [$d['running'], $d['balance']], [true, DEMO_BALANCE]);
@@ -139,6 +143,19 @@ check('blocked card cannot start', reason(function () use ($b) {
     db()->prepare("UPDATE cards SET status = 'blocked' WHERE id = ?")->execute([$b]);
     begin_machine_session('W1', '04FFEE11');
 }), 'blocked');
+
+// PLC link settings (plc.php).
+check('plc defaults: laptop is the server on 502', [plc_settings()['plc_mode'], plc_settings()['plc_listen_port']], ['server', '502']);
+check('client mode saved', save_plc_settings(['plc_mode' => 'client', 'plc_ip' => '192.168.0.50', 'plc_port' => '1502', 'plc_unit_id' => '1', 'plc_poll_ms' => '200']), []);
+check('client mode settings read back', [plc_settings()['plc_mode'], plc_settings()['plc_ip'], plc_settings()['plc_port']], ['client', '192.168.0.50', '1502']);
+check('server values kept while in client mode', plc_settings()['plc_listen_port'], '502');
+check('bad PLC IP refused', count(save_plc_settings(['plc_mode' => 'client', 'plc_ip' => '192.168.0.300', 'plc_port' => '502', 'plc_unit_id' => '1', 'plc_poll_ms' => '200'])), 1);
+check('0.0.0.0 is not a PLC address', count(save_plc_settings(['plc_mode' => 'client', 'plc_ip' => '0.0.0.0', 'plc_port' => '502', 'plc_unit_id' => '1', 'plc_poll_ms' => '200'])), 1);
+check('bad port refused', count(save_plc_settings(['plc_mode' => 'server', 'plc_listen_ip' => '0.0.0.0', 'plc_listen_port' => '70000'])), 1);
+check('refused input changes nothing', plc_settings()['plc_ip'], '192.168.0.50');
+check('server mode with an allowed PLC', save_plc_settings(['plc_mode' => 'server', 'plc_listen_ip' => '', 'plc_listen_port' => '5020', 'plc_allowed_ip' => '192.168.1.20']), []);
+check('empty listen IP means all', [plc_settings()['plc_listen_ip'], plc_settings()['plc_allowed_ip'], plc_settings()['test_mode']], ['0.0.0.0', '192.168.1.20', '0']);
+check('test mode off again after save without it', test_mode(), false);
 
 foreach (glob($dbFile . '*') as $f) @unlink($f);
 echo $failures ? "\n$failures FAILED\n" : "\nALL PASSED\n";

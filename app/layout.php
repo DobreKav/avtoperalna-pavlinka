@@ -7,6 +7,7 @@ function page_header(string $title, ?array $user = null, bool $autoRefresh = fal
         'cards.php' => 'Картички',
         'sessions.php' => 'Перења',
         'machines.php' => 'Цени',
+        'plc.php' => 'PLC врска',
     ];
     ?><!doctype html>
 <html lang="mk">
