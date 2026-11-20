@@ -17,7 +17,7 @@ namespace PeralnaSetup
     static class Product
     {
         public const string Name = "Автоперална Павлинка";
-        public const string Version = "1.3.0";
+        public const string Version = "1.4.0";
         public const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\AvtoperalnaPavlinka";
         // Allows the agent itself (any port chosen on the "PLC врска" page), not just port 502.
         public const string FirewallRule = "Avtoperalna Pavlinka - PLC Modbus";
