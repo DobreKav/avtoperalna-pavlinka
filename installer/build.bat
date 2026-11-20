@@ -23,6 +23,7 @@ copy /Y ..\README.md "%STAGE%\" >nul
 xcopy /E /I /Q /Y ..\app "%STAGE%\app" >nul
 xcopy /E /I /Q /Y ..\www "%STAGE%\www" >nul
 copy /Y ..\plc\*.scl "%STAGE%\plc\" >nul
+copy /Y ..\plc\*.txt "%STAGE%\plc\" >nul
 copy /Y php.ini "%STAGE%\php\" >nul
 for %%F in (php.exe php8ts.dll libsqlite3.dll) do copy /Y "%PHPSRC%\%%F" "%STAGE%\php\" >nul || goto :fail
 for %%F in (php_pdo_sqlite.dll php_mbstring.dll) do copy /Y "%PHPSRC%\ext\%%F" "%STAGE%\php\ext\" >nul || goto :fail

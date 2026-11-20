@@ -132,3 +132,4 @@ tr.clickable:hover { background: #f8fafc; }
 .mode-fields .grid { align-items: start; }
 label.check input { width: auto; }
 .plc-form label.check { font-size: 15px; color: var(--ink); }
+[hidden] { display: none !important; }

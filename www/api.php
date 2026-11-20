@@ -56,6 +56,7 @@ try {
             // agent.ini) instead of overriding it with the defaults.
             if (setting('plc_mode') === null && isset($input['cur_mode'])) {
                 save_plc_settings([
+                    'plc_model' => $input['cur_model'] ?? 's7-1200',
                     'plc_mode' => $input['cur_mode'],
                     'plc_listen_ip' => $input['cur_listen_ip'] ?? '',
                     'plc_listen_port' => $input['cur_listen_port'] ?? '',

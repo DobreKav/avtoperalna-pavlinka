@@ -5,6 +5,9 @@
 //   server  this program listens, the PLC connects with MB_CLIENT  (plc\FB_Peralna.scl)
 //   client  this program connects to the PLC, which runs MB_SERVER  (plc\FB_Peralna_Server.scl)
 // IP addresses and ports are typed on that page; the agent applies them within seconds.
+// Delta DVP12SE (plc\Delta_DVP12SE.txt) is always "client": its Ethernet port is a Modbus TCP
+// server and the register map below sits in D registers, register 0 = D0 = Modbus 4096 (16#1000)
+// unless another first D register is set on that page.
 //
 // Holding registers (the same map in both modes, 0-based):
 //   0  enable          1 = machine may run, 0 = stop       (also coil 0, FC1)
@@ -86,6 +89,9 @@ namespace Peralna
                     case "plc_allowed_ip": c.Plc.AllowedIp = val; break;
                     case "plc_ip": c.Plc.PlcIp = val; break;
                     case "plc_port": c.Plc.PlcPort = int.Parse(val); break;
+                    case "plc_model":
+                        if (val.ToLowerInvariant() == "dvp12se") { c.Plc.Model = "dvp12se"; c.Plc.Mode = "client"; c.Plc.RegBase = 4096; }
+                        break;
                     case "reader": c.Reader = val; break;
                     case "tick_seconds": c.TickSeconds = Math.Max(5, int.Parse(val)); break;
                     case "offline_stop_seconds": c.OfflineStopSeconds = Math.Max(10, int.Parse(val)); break;
@@ -128,20 +134,26 @@ namespace Peralna
         public int UnitId = 1;
         public int PollMs = 200;
         public bool TestMode = false;        // emulators and the demo card allowed
+        public string Model = "s7-1200";     // "s7-1200" or "dvp12se" (Delta, always client mode here)
+        public int RegBase = 0;              // Modbus address of register 0 (Delta: 4096 = D0)
+
+        public bool IsDelta { get { return Model == "dvp12se"; } }
 
         public string Key()
         {
-            return Mode + "|" + ListenIp + "|" + ListenPort + "|" + AllowedIp + "|" + PlcIp + "|" + PlcPort + "|" + UnitId + "|" + PollMs + "|" + TestMode;
+            return Mode + "|" + ListenIp + "|" + ListenPort + "|" + AllowedIp + "|" + PlcIp + "|" + PlcPort + "|" + UnitId + "|" + PollMs + "|" + TestMode + "|" + Model + "|" + RegBase;
         }
 
         public string LinkKey()
         {
             // Test mode only matters to the server's loopback rule, not to the client.
-            return Mode == "client" ? Mode + "|" + PlcIp + "|" + PlcPort + "|" + UnitId + "|" + PollMs : Key();
+            return Mode == "client" ? Mode + "|" + PlcIp + "|" + PlcPort + "|" + UnitId + "|" + PollMs + "|" + Model + "|" + RegBase : Key();
         }
 
         public string Describe()
         {
+            if (IsDelta)
+                return "Лаптоп → Delta DVP12SE " + PlcIp + ":" + PlcPort + " (D" + (RegBase - 4096) + "–D" + (RegBase - 4096 + 52) + ")";
             return Mode == "client"
                 ? "Лаптоп → PLC " + PlcIp + ":" + PlcPort
                 : "Лаптопот слуша на " + ListenIp + ":" + ListenPort + (AllowedIp.Length > 0 ? " (само " + AllowedIp + ")" : "");
@@ -181,6 +193,14 @@ namespace Peralna
             p.UnitId = Num(d, "plc_unit_id", p.UnitId, 0, 255);
             p.PollMs = Num(d, "plc_poll_ms", p.PollMs, 50, 2000);
             if (d.TryGetValue("test_mode", out v) && v != null) p.TestMode = v.ToString() == "1";
+            if (d.TryGetValue("plc_model", out v) && v != null) p.Model = v.ToString() == "dvp12se" ? "dvp12se" : "s7-1200";
+            p.RegBase = Num(d, "plc_reg_base", p.RegBase, 0, 65535 - 52);
+            if (p.IsDelta)
+            {
+                p.Mode = "client";   // the DVP12SE is the Modbus TCP server on its Ethernet port
+                if (p.RegBase < 4096 || p.RegBase > 4096 + 4095 - 52) p.RegBase = 4096;
+            }
+            else p.RegBase = 0;
             return p;
         }
     }
@@ -521,9 +541,16 @@ namespace Peralna
 
         void Exchange(NetworkStream s)
         {
-            WriteBlock(s, 0, regs.Snapshot(0, 10));
-            WriteBlock(s, 20, regs.Snapshot(20, 33));
-            ushort[] back = ReadBlock(s, 10, 10);
+            ushort[] head = regs.Snapshot(0, 10);
+            if (cfg.IsDelta)
+            {
+                // Delta D registers are signed 16-bit: keep the numbers positive on the HMI.
+                // The heartbeat (5) may wrap, the PLC only compares it for a change.
+                foreach (int i in new[] { 1, 2, 3, 6 }) if (head[i] > 32767) head[i] = 32767;
+            }
+            WriteBlock(s, cfg.RegBase, head);
+            WriteBlock(s, cfg.RegBase + 20, regs.Snapshot(20, 33));
+            ushort[] back = ReadBlock(s, cfg.RegBase + 10, 10);
             for (int i = 0; i < back.Length; i++) regs.Set(10 + i, back[i]);
         }
 
@@ -547,9 +574,10 @@ namespace Peralna
             if ((reply[0] & 0x80) != 0)
             {
                 int code = reply.Length > 1 ? reply[1] : 0;
-                throw new Exception(code == 2
-                    ? "PLC-то ја одби адресата: MB_HOLD_REG во PLC-то мора да има најмалку 53 регистри (Array[0..52] of Word)"
-                    : "PLC-то врати Modbus грешка " + code);
+                string bad = cfg.IsDelta
+                    ? "Delta PLC-то ја одби адресата: провери го почетниот D регистар (D0 = Modbus 4096) во админ панелот"
+                    : "PLC-то ја одби адресата: MB_HOLD_REG во PLC-то мора да има најмалку 53 регистри (Array[0..52] of Word)";
+                throw new Exception(code == 2 ? bad : "PLC-то врати Modbus грешка " + code);
             }
             if (reply[0] != pdu[0]) throw new IOException("неочекуван Modbus одговор");
             return reply;
@@ -913,7 +941,7 @@ namespace Peralna
                     link.Stop();
                 }
                 link = next.Mode == "client" ? (IPlcLink)new ModbusClient(regs, next) : new ModbusServer(regs, next);
-                if (next.Mode == "client") Log.Write("PLC link: " + next.Describe() + ", every " + next.PollMs + " ms, unit " + next.UnitId);
+                if (next.Mode == "client") Log.Write("PLC link: " + next.Describe() + ", every " + next.PollMs + " ms, unit " + next.UnitId + ", register 0 = Modbus " + next.RegBase);
                 link.Start();
             }
             if (testChanged)
@@ -1217,6 +1245,7 @@ namespace Peralna
             f["cur_allowed_ip"] = plc.AllowedIp;
             f["cur_plc_ip"] = plc.PlcIp;
             f["cur_plc_port"] = plc.PlcPort.ToString();
+            f["cur_model"] = plc.Model;
             Dictionary<string, object> r = api.Call("status", f);
             object conf;
             if (r != null && r.TryGetValue("config", out conf) && conf is Dictionary<string, object>)
@@ -1284,7 +1313,7 @@ namespace Peralna
 
     static class Program
     {
-        public const string Version = "1.3.0";
+        public const string Version = "1.4.0";
 
         static void Main(string[] args)
         {

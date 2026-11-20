@@ -42,6 +42,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $form = array_merge($form, array_intersect_key($_POST, PLC_DEFAULTS));
     $form['test_mode'] = !empty($_POST['test_mode']) ? '1' : '0';
 }
+$isDelta = $form['plc_model'] === 'dvp12se';
+// The Delta block is typed as its first D register; stored as a Modbus address (D0 = 4096).
+$dStart = isset($_POST['plc_d_start']) ? (string)$_POST['plc_d_start']
+    : (string)($isDelta ? max(0, (int)$form['plc_reg_base'] - DELTA_D0) : 0);
 
 $st = link_status();
 $ips = $st['local_ips'];
@@ -63,6 +67,19 @@ page_header('PLC врска', $user);
 
 <form method="post" class="card plc-form">
   <?= csrf_field() ?>
+  <h2>Кое PLC?</h2>
+  <div class="mode-pick">
+    <label class="mode-option">
+      <input type="radio" name="plc_model" value="s7-1200" <?= !$isDelta ? 'checked' : '' ?>>
+      <span><b>Siemens S7-1200</b><small>Програми во TIA Portal: <code>plc\FB_Peralna.scl</code> или <code>plc\FB_Peralna_Server.scl</code>.</small></span>
+    </label>
+    <label class="mode-option">
+      <input type="radio" name="plc_model" value="dvp12se" <?= $isDelta ? 'checked' : '' ?>>
+      <span><b>Delta DVP12SE</b><small>Вградениот Ethernet е Modbus TCP сервер, лаптопот се поврзува на него. Програма за ISPSoft / WPLSoft: <code>plc\Delta_DVP12SE.txt</code>.</small></span>
+    </label>
+  </div>
+
+  <div class="siemens-only">
   <h2>Кој кого повикува?</h2>
   <div class="mode-pick">
     <label class="mode-option">
@@ -93,27 +110,36 @@ page_header('PLC врска', $user);
     </div>
     <p class="muted">Во <code>FB_Peralna.scl</code> внеси ја IP адресата на лаптопот (<b><?= e($laptopIp) ?></b>) во четирите <code>ADDR</code> линии и портата во <code>RemotePort</code>.</p>
   </fieldset>
+  </div>
 
   <fieldset class="mode-fields" data-mode="client">
-    <legend>PLC-то е сервер</legend>
+    <legend><span class="siemens-only">PLC-то е сервер</span><span class="delta-only">Delta DVP12SE (Modbus TCP сервер)</span></legend>
     <div class="grid">
       <label>IP на PLC-то
         <input name="plc_ip" value="<?= e($form['plc_ip']) ?>" placeholder="192.168.1.20" inputmode="decimal">
-        <small>Од TIA Portal → PROFINET интерфејс</small>
+        <small class="siemens-only">Од TIA Portal → PROFINET интерфејс</small>
+        <small class="delta-only">Од ISPSoft / DCISoft → Ethernet поставки (фабрички често 192.168.1.5)</small>
       </label>
       <label>Порта на PLC-то
         <input name="plc_port" value="<?= e($form['plc_port']) ?>" placeholder="502" inputmode="numeric">
-        <small>Иста како <code>LocalPort</code> во програмата</small>
+        <small class="siemens-only">Иста како <code>LocalPort</code> во програмата</small>
+        <small class="delta-only">Modbus TCP на DVP12SE е 502</small>
       </label>
       <label>Unit ID
         <input name="plc_unit_id" value="<?= e($form['plc_unit_id']) ?>" placeholder="1" inputmode="numeric">
-        <small>S7-1200 MB_SERVER прифаќа било кој</small>
+        <small class="siemens-only">S7-1200 MB_SERVER прифаќа било кој</small>
+        <small class="delta-only">За DVP12SE остави 1</small>
       </label>
       <label>Освежување (ms)
         <input name="plc_poll_ms" value="<?= e($form['plc_poll_ms']) ?>" placeholder="200" inputmode="numeric">
         <small>50–2000, стандардно 200</small>
       </label>
+      <label class="delta-only">Почетен D регистар
+        <input name="plc_d_start" value="<?= e($dStart) ?>" placeholder="0" inputmode="numeric">
+        <small>0 = D0…D52 (Modbus 4096…4148). Мора да е ист како во PLC програмата.</small>
+      </label>
     </div>
+    <p class="muted delta-only">Во DVP12SE не се пишува ништо за лаптопот. Програмата <code>plc\Delta_DVP12SE.txt</code> ги користи D0–D52, копчињата X0 ПЕНА, X1 ВОДА, X2 СТОП и излезите Y0 пена, Y1 вода, Y2 подготвено.</p>
   </fieldset>
 
   <h2>Тест режим</h2>
@@ -128,10 +154,14 @@ page_header('PLC врска', $user);
 
 <script>
 (function () {
-  var radios = document.querySelectorAll('input[name="plc_mode"]');
+  var radios = document.querySelectorAll('input[name="plc_mode"], input[name="plc_model"]');
   function show() {
-    var mode = document.querySelector('input[name="plc_mode"]:checked').value;
+    var delta = document.querySelector('input[name="plc_model"]:checked').value === 'dvp12se';
+    // The DVP12SE is always the server: the laptop connects to it.
+    var mode = delta ? 'client' : document.querySelector('input[name="plc_mode"]:checked').value;
     document.querySelectorAll('.mode-fields').forEach(function (f) { f.hidden = f.dataset.mode !== mode; });
+    document.querySelectorAll('.delta-only').forEach(function (el) { el.hidden = !delta; });
+    document.querySelectorAll('.siemens-only').forEach(function (el) { el.hidden = delta; });
   }
   radios.forEach(function (r) { r.addEventListener('change', show); });
   show();

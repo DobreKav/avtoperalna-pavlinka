@@ -148,7 +148,17 @@ function setting(string $key, ?string $value = null): ?string
 //   client  the laptop connects to the PLC (plc_ip:plc_port), the PLC runs MB_SERVER
 //           (plc\FB_Peralna_Server.scl). Nothing about the laptop goes into the PLC.
 
+// PLC models. Delta DVP12SE is always the Modbus TCP server (built into its Ethernet port);
+// its data registers D0..D4095 sit at Modbus address 4096 (16#1000) and up.
+const PLC_MODELS = [
+    's7-1200' => 'Siemens S7-1200',
+    'dvp12se' => 'Delta DVP12SE',
+];
+const DELTA_D0 = 4096;
+
 const PLC_DEFAULTS = [
+    'plc_model' => 's7-1200',
+    'plc_reg_base' => '0',      // Modbus address of register 0 (Delta: 4096 + the first D register)
     'plc_mode' => 'server',
     'plc_listen_ip' => '0.0.0.0',
     'plc_listen_port' => '502',
@@ -186,8 +196,12 @@ function valid_port(string $port): bool
  */
 function save_plc_settings(array $in): array
 {
-    $mode = ($in['plc_mode'] ?? '') === 'client' ? 'client' : 'server';
+    $model = array_key_exists((string)($in['plc_model'] ?? ''), PLC_MODELS) ? (string)$in['plc_model'] : 's7-1200';
+    // The DVP12SE cannot be pointed at the laptop; the laptop always connects to it.
+    $mode = $model === 'dvp12se' || ($in['plc_mode'] ?? '') === 'client' ? 'client' : 'server';
     $v = [
+        'plc_model' => $model,
+        'plc_reg_base' => '0',
         'plc_mode' => $mode,
         'plc_listen_ip' => trim((string)($in['plc_listen_ip'] ?? '')),
         'plc_listen_port' => trim((string)($in['plc_listen_port'] ?? '')),
@@ -199,6 +213,16 @@ function save_plc_settings(array $in): array
         'test_mode' => !empty($in['test_mode']) ? '1' : '0',
     ];
     $errors = [];
+    if ($model === 'dvp12se') {
+        // Typed as the first D register (D0 by default); the block needs 53 registers (D0..D52).
+        $d = trim((string)($in['plc_d_start'] ?? '0'));
+        if ($d === '') $d = '0';
+        if (!ctype_digit($d) || (int)$d > 4095 - 52) {
+            $errors[] = 'Почетниот D регистар мора да е број од 0 до ' . (4095 - 52) . ' (стандардно 0, т.е. D0).';
+        } else {
+            $v['plc_reg_base'] = (string)(DELTA_D0 + (int)$d);
+        }
+    }
     if ($mode === 'server') {
         if ($v['plc_listen_ip'] === '') $v['plc_listen_ip'] = '0.0.0.0';
         if (!valid_ipv4($v['plc_listen_ip'])) $errors[] = 'IP адресата на која слуша лаптопот не е валидна (на пример 0.0.0.0 или 192.168.1.10).';

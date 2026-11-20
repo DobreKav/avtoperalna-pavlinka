@@ -6,3 +6,4 @@ installer/dist/
 agent/PeralnaAgent.exe
 agent/agent.log
 *.log
+__pycache__/
