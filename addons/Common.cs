@@ -31,6 +31,7 @@ namespace PeralnaAddons
                 case 6: return "Грешка на серверот";
                 case 7: return "Нема читач на картички";
                 case 8: return "Картичката не може да се прочита";
+                case 9: return "Машината не е во ред (аварија / заштита / вода)";
                 default: return "Статус " + status;
             }
         }

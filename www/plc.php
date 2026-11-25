@@ -105,7 +105,7 @@ page_header('PLC врска', $user);
       </label>
       <label>Дозволена IP на PLC-то
         <input name="plc_allowed_ip" value="<?= e($form['plc_allowed_ip']) ?>" placeholder="празно = било која" inputmode="decimal">
-        <small>Ако е пополнета, само тоа PLC смее да се поврзе</small>
+        <small>Ако е пополнета, само тоа PLC смее да се поврзе. Препорачано: внеси ја.</small>
       </label>
     </div>
     <p class="muted">Во <code>FB_Peralna.scl</code> внеси ја IP адресата на лаптопот (<b><?= e($laptopIp) ?></b>) во четирите <code>ADDR</code> линии и портата во <code>RemotePort</code>.</p>
@@ -136,11 +136,12 @@ page_header('PLC врска', $user);
       </label>
       <label class="delta-only">Почетен D регистар
         <input name="plc_d_start" value="<?= e($dStart) ?>" placeholder="0" inputmode="numeric">
-        <small>0 = D0…D52 (Modbus 4096…4148). Мора да е ист како во PLC програмата.</small>
+        <small>0 = D0…D52 (Modbus 4096…4148). Од 0 до 247. Мора да е ист како во PLC програмата.</small>
       </label>
     </div>
-    <p class="muted delta-only">Во DVP12SE не се пишува ништо за лаптопот. Програмата <code>plc\Delta_DVP12SE.txt</code> ги користи D0–D52, копчињата X0 ПЕНА, X1 ВОДА, X2 СТОП и излезите Y0 пена, Y1 вода, Y2 подготвено.</p>
+    <p class="muted delta-only">Во DVP12SE не се пишува ништо за лаптопот. Програмата <code>plc\Delta_DVP12SE.txt</code> ги користи D0–D52, копчињата X0 ПЕНА, X1 ВОДА, X2 СТОП, влезот X3 „машината е во ред“ (аварија, заштита на пумпата, вода) и излезите Y0 пена, Y1 вода, Y2 подготвено, Y3 нема врска.</p>
   </fieldset>
+  <p class="muted">🔒 Modbus TCP нема лозинка: секој уред во мрежата до PLC-то може да го пушти боксот. Лаптопот и PLC-то нека бидат на посебен кабел или свич, без Wi-Fi за гости.</p>
 
   <h2>Тест режим</h2>
   <label class="check">

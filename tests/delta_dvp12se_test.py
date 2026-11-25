@@ -77,7 +77,13 @@ def test_program():
     with plc.lock:
         plc.D[0], plc.D[1] = 1, 125
     threading.Thread(target=laptop, daemon=True).start()
+    time.sleep(0.3)
+    check("X3 'machine OK' open: no ready lamp, D11 = 1", not plc.outputs()[2] and plc.d(11) == 1, (plc.outputs(), plc.d(11)))
+    plc.pulse("X0")
+    check("X3 open: ПЕНА does nothing", not plc.outputs()[0] and plc.d(10) == 0)
+    plc.press("X3")                     # E-stop, motor protection and water level all OK
     check("card inside: Y2 ready lamp", wait(lambda: plc.outputs()[2], 1))
+    check("X3 closed: D11 = 0", plc.d(11) == 0)
     check("mm:ss of 125 s is 2:05 (D310/D311)", wait(lambda: (plc.d(310), plc.d(311)) == (2, 5), 1),
           (plc.d(310), plc.d(311)))
 
@@ -117,6 +123,17 @@ def test_program():
         plc.D[0] = 1
     plc.pulse("X1")
     check("water on again", wait(lambda: plc.outputs()[1], 1))
+    plc.press("X3", False)              # E-stop pressed / motor protection tripped / no water
+    check("X3 opens: water off at once, D10 = 0, D11 = 1",
+          wait(lambda: not plc.outputs()[1] and plc.d(10) == 0 and plc.d(11) == 1, 1), (plc.outputs(), plc.d(10), plc.d(11)))
+    check("X3 open: ready lamp off", not plc.outputs()[2])
+    plc.pulse("X1")
+    check("X3 open: ВОДА is ignored", not plc.outputs()[1])
+    plc.press("X3")
+    time.sleep(0.2)
+    check("X3 closed again: nothing starts by itself, D11 = 0", not plc.outputs()[0] and not plc.outputs()[1] and plc.d(11) == 0)
+    plc.pulse("X1")
+    check("water on again after X3", wait(lambda: plc.outputs()[1], 1))
 
     beat["on"] = False
     t0 = time.time()
@@ -224,6 +241,8 @@ def test_chain():
               errors)
         check("bad first D register refused",
               "D регистар" in c.php("echo implode(' ', save_plc_settings(['plc_model' => 'dvp12se', 'plc_ip' => '127.0.0.1', 'plc_port' => '502', 'plc_unit_id' => '1', 'plc_poll_ms' => '100', 'plc_d_start' => '5000']));"))
+        check("first D register 300 refused (overlaps D300..D311)",
+              "D регистар" in c.php("echo implode(' ', save_plc_settings(['plc_model' => 'dvp12se', 'plc_ip' => '127.0.0.1', 'plc_port' => '502', 'plc_unit_id' => '1', 'plc_poll_ms' => '100', 'plc_d_start' => '300']));"))
 
         ini = os.path.join(work, "agent.ini")
         with open(ini, "w", encoding="utf-8") as f:
@@ -240,6 +259,9 @@ def test_chain():
         link = c.php("echo setting('plc_link');")
         check("admin panel shows the Delta link", "Delta DVP12SE" in link and "D0–D52" in link, link)
         check("Y3 'no link' lamp off", not plc.outputs()[3])
+        check("X3 open: D4 = 9 'machine not OK', even without a card", wait(lambda: plc.d(4) == 9, 3), plc.d(4))
+        plc.press("X3")                 # machine OK chain closed
+        check("X3 closed: D4 = 0 'insert card'", wait(lambda: plc.d(4) == 0, 3), plc.d(4))
 
         c.say("in DEADBEEF")
         check("unknown card: D4 = 4, D0 = 0", wait(lambda: plc.d(4) == 4 and plc.d(0) == 0, 4), (plc.d(4), plc.d(0)))
@@ -277,6 +299,19 @@ def test_chain():
         plc.pulse("X1")
         check("ВОДА: Y1 on", wait(lambda: plc.outputs()[1], 1))
         time.sleep(3)
+        pauses = sum("STOP: billing paused" in l for l in c.log)
+        plc.press("X3", False)          # motor protection trips while the water runs
+        check("X3 opens: Y1 off at once", wait(lambda: not plc.outputs()[1], 1))
+        check("X3 open: the agent shows status 9 in D4", wait(lambda: plc.d(4) == 9, 3), plc.d(4))
+        check("X3 open: the agent logs it and pauses billing",
+              wait(lambda: any("machine NOT OK" in l for l in c.log) and sum("STOP: billing paused" in l for l in c.log) > pauses, 3))
+        time.sleep(0.5)
+        charged = plc.d(3)
+        time.sleep(4)
+        check("X3 open: nothing is charged", plc.d(3) == charged, (plc.d(3), charged))
+        check("admin panel shows the machine fault", c.php("echo setting('plc_fault');") == "1")
+        plc.press("X3")
+        check("X3 closed: D4 back to 1, water stays off", wait(lambda: plc.d(4) == 1, 3) and not plc.outputs()[1], plc.d(4))
         c.say("out")
         check("card out: D0 = 0, outputs off", wait(lambda: plc.d(0) == 0 and plc.outputs() == (False, False, False, False), 3),
               plc.outputs())

@@ -19,8 +19,13 @@
 //   Regs[0] enable 1/0 · Regs[1] seconds left · Regs[2] balance · Regs[3] charged
 //   Regs[4] status     · Regs[5] heartbeat    · Regs[6] minutes left
 //   Regs[20] name length · Regs[21..52] card holder name, one UTF-16 character per register
-// Written by this PLC and read by the laptop (40011 = register 10): the program, 0 СТОП, 1 ПЕНА, 2 ВОДА.
+// Written by this PLC and read by the laptop (40011 = register 10): the program, 0 СТОП, 1 ПЕНА, 2 ВОДА;
+// register 11: 1 = the machine is not OK (MachineOk off).
 // Registers 10..19 belong to the PLC; the laptop never writes them.
+//
+// Network: Modbus TCP has no password. Keep the laptop and the PLC on their own cable or switch,
+// without guest Wi-Fi. For more safety type the laptop's IP into the four RemoteAddress lines
+// below instead of 0.0.0.0: then MB_SERVER accepts only the laptop.
 //
 // Touch panel (WinCC, e.g. KTP700 Basic): use the instance DB "FB_Peralna_DB".
 //   Text field      CardName (WString)          - card holder name
@@ -29,23 +34,32 @@
 //   Symbolic field  Status (UInt) + text list   - 0 Стави картичка · 1 Работи · 2 Парите се потрошени ·
 //                                                 3 Нема доволно пари · 4 Непозната картичка ·
 //                                                 5 Блокирана картичка · 6 Грешка на серверот ·
-//                                                 7 Нема читач · 8 Картичката не се чита
+//                                                 7 Нема читач · 8 Картичката не се чита ·
+//                                                 9 Машината не е во ред (аварија / заштита / вода)
 //   Buttons         HmiFoam / HmiWater / HmiStop - event Press: SetBit, Release: ResetBit
-//   Lamps           Foam, Water, CommOk; Program (0 none, 1 ПЕНА, 2 ВОДА) for the active button colour
+//   Lamps           Foam, Water, CommOk, Fault; Program (0 none, 1 ПЕНА, 2 ВОДА) for the active button colour
+//
+// Safety: the E-stop must cut the pump contactors' power directly (hard-wired), independent of this
+// PLC and the laptop; MachineOk only tells the PLC and the laptop about it. In Device configuration
+// keep "Reaction to CPU STOP" of the outputs at "Use substitute value" 0 (never "Keep last value").
 
 FUNCTION_BLOCK "FB_Peralna_Server"
 { S7_Optimized_Access := 'TRUE' }
-VERSION : 0.1
+VERSION : 0.2
    VAR_INPUT
       BtnFoam : Bool;    // push button "ПЕНА" on the bay
       BtnWater : Bool;   // push button "ВОДА"
       BtnStop : Bool;    // push button "СТОП" (pauses the spray and the billing)
+      MachineOk : Bool;  // NC chain, TRUE = the machine may run: E-stop auxiliary contact, pump motor
+                         // protection, water level / pressure switch in series. FALSE (or a broken
+                         // wire) stops foam and water and the billing. Not connected = FALSE = no washing.
    END_VAR
 
    VAR_OUTPUT
       Foam : Bool;          // output to the foam pump / valve
       Water : Bool;         // output to the water pump / valve
-      Enabled : Bool;       // card inside, money on it, link to the laptop is healthy
+      Enabled : Bool;       // card inside, money on it, link to the laptop is healthy, machine OK
+      Fault : Bool;         // MachineOk is off: E-stop pressed, motor protection tripped or no water
       CommOk : Bool;        // laptop heartbeat seen within the last 5 s
       Program : Int;        // 0 none, 1 foam, 2 water
       CardName : WString[32];
@@ -84,15 +98,20 @@ BEGIN
    #Conn.ID := 1;                         // any free connection id
    #Conn.ConnectionType := 16#0B;         // TCP
    #Conn.ActiveEstablished := FALSE;      // passive: the laptop opens the connection
-   #Conn.RemoteAddress.ADDR[1] := 0;      // 0.0.0.0 = accept the laptop from any address
+   #Conn.RemoteAddress.ADDR[1] := 0;      // 0.0.0.0 = accept any address; the laptop's IP = only the laptop
    #Conn.RemoteAddress.ADDR[2] := 0;
    #Conn.RemoteAddress.ADDR[3] := 0;
    #Conn.RemoteAddress.ADDR[4] := 0;
    #Conn.RemotePort := 0;
    #Conn.LocalPort := 502;                // "Порта на PLC-то" in the admin panel
 
-   // The program chosen on the bay goes to register 10 for the laptop to read.
+   // The program chosen on the bay and the fault go to registers 10..11 for the laptop to read.
    #Regs[10] := INT_TO_WORD(#Program);
+   IF #Fault THEN
+      #Regs[11] := 16#0001;
+   ELSE
+      #Regs[11] := 16#0000;
+   END_IF;
 
    #Server(DISCONNECT := FALSE,
            MB_HOLD_REG := #Regs,
@@ -114,8 +133,10 @@ BEGIN
    #WatchdogTimer(IN := NOT #Fresh, PT := T#5S);
    #CommOk := NOT #WatchdogTimer.Q;
 
-   // ── Bay ──────────────────────────────────────────────────────
-   #Enabled := #CommOk AND (#Regs[0] = 1);
+   // ── Bay (shared: keep identical in FB_Peralna.scl and FB_Peralna_Server.scl) ──
+   // tests/plc_sources_test.py checks that this part of the two files is the same.
+   #Fault := NOT #MachineOk;
+   #Enabled := #CommOk AND (#Regs[0] = 1) AND #MachineOk;
 
    IF NOT #Enabled OR #BtnStop OR #HmiStop THEN
       #Program := 0;
@@ -132,6 +153,9 @@ BEGIN
    #Balance := WORD_TO_UINT(#Regs[2]);
    #Charged := WORD_TO_UINT(#Regs[3]);
    #Status := WORD_TO_UINT(#Regs[4]);
+   IF #Fault THEN
+      #Status := 9;                      // shown even without a card or a laptop
+   END_IF;
    IF #Enabled THEN
       #SecondsLeft := WORD_TO_UINT(#Regs[1]);
    ELSE
@@ -166,9 +190,10 @@ END_FUNCTION_BLOCK
 //   "FB_Peralna_Server_DB"(BtnFoam  := "I_Pena",
 //                   BtnWater := "I_Voda",
 //                   BtnStop  := "I_Stop",
+//                   MachineOk := "I_MachineOk",
 //                   Foam     => "Q_Pena",
 //                   Water    => "Q_Voda",
 //                   SecondsBCD => "QW_Sekundarnik");
 //
-// Tags (example): I_Pena %I0.0, I_Voda %I0.1, I_Stop %I0.2, Q_Pena %Q0.0, Q_Voda %Q0.1,
+// Tags (example): I_Pena %I0.0, I_Voda %I0.1, I_Stop %I0.2, I_MachineOk %I0.3 (NC chain), Q_Pena %Q0.0, Q_Voda %Q0.1,
 // QW_Sekundarnik %QW2 (4-digit BCD display; leave it out if the display is driven by the touch panel only)

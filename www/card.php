@@ -17,6 +17,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     check_csrf();
     $action = (string)($_POST['action'] ?? '');
     try {
+        if (($action === 'topup' || $action === 'adjust') && form_already_sent()) {
+            // Second click on the same form: the first one already booked it.
+            redirect('card.php?id=' . $id);
+        }
         if ($action === 'topup') {
             $amount = (int)($_POST['amount'] ?? 0);
             if ($amount <= 0) throw new WalletError('Внеси позитивен износ.');
@@ -85,13 +89,13 @@ page_header($card['holder_name'] ?: $card['uid'], $user);
   <section class="card">
     <h2>Полнење</h2>
     <form method="post" class="presets">
-      <?= csrf_field() ?><input type="hidden" name="action" value="topup">
+      <?= csrf_field() ?><?= once_field() ?><input type="hidden" name="action" value="topup">
       <?php foreach (config('topup_presets') as $p): ?>
         <button name="amount" value="<?= (int)$p ?>" class="primary">+<?= money((int)$p) ?></button>
       <?php endforeach; ?>
     </form>
     <form method="post" class="inline">
-      <?= csrf_field() ?><input type="hidden" name="action" value="topup">
+      <?= csrf_field() ?><?= once_field() ?><input type="hidden" name="action" value="topup">
       <input type="number" name="amount" min="1" step="1" placeholder="Друг износ" required>
       <input name="note" placeholder="Белешка (опционално)">
       <button class="primary">Наполни</button>
@@ -101,7 +105,7 @@ page_header($card['holder_name'] ?: $card['uid'], $user);
   <section class="card">
     <h2>Корекција / враќање</h2>
     <form method="post" class="stack">
-      <?= csrf_field() ?><input type="hidden" name="action" value="adjust">
+      <?= csrf_field() ?><?= once_field() ?><input type="hidden" name="action" value="adjust">
       <label>Износ (минус одзема) <input type="number" name="amount" step="1" required></label>
       <label>Тип <select name="kind"><option value="adjust">Корекција</option><option value="refund">Враќање (машината не работела)</option></select></label>
       <label>Причина <input name="note" required></label>

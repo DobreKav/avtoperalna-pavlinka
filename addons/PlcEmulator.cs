@@ -46,7 +46,7 @@ namespace PeralnaAddons
             }
         }
 
-        // FC6: the PLC reports its program in register 10.
+        // FC6: the PLC reports its program in register 10 and the fault in register 11.
         public bool WriteSingle(string host, int port, int address, int value)
         {
             try
@@ -111,6 +111,7 @@ namespace PeralnaAddons
         readonly Lamp qFoam = new Lamp();
         readonly Lamp qWater = new Lamp();
         readonly Lamp qEnable = new Lamp();
+        readonly CheckBox machineOkBox = new CheckBox();
         readonly Label display = new Label();
         readonly Label displayWord = new Label();
         readonly Label watchdog = new Label();
@@ -123,6 +124,7 @@ namespace PeralnaAddons
         int lastHeartbeat = -1;
         DateTime lastHeartbeatChange = DateTime.MinValue;
         volatile int program;   // 0 none, 1 foam, 2 water; written to register 10 for billing
+        volatile bool machineOk = true;   // input I0.3, NC chain (E-stop, motor protection, water)
 
         public PlcEmulatorForm()
         {
@@ -133,7 +135,7 @@ namespace PeralnaAddons
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(860, 470);
+            ClientSize = new Size(860, 500);
 
             port = int.Parse(AgentIni.Get("modbus_port", "502"));
             BuildHmi();
@@ -222,19 +224,24 @@ namespace PeralnaAddons
             linkText.SetBounds(36, 66, 236, 24);
             link.Controls.AddRange(new Control[] { hl, hostBox, pl, portBox, linkLamp, linkText });
 
-            GroupBox inputs = Group("Копчиња на боксот (влезови)", x, 142, w, 72);
+            GroupBox inputs = Group("Копчиња на боксот (влезови)", x, 142, w, 100);
             Button iFoam = SmallButton("I0.0 ПЕНА", 12), iWater = SmallButton("I0.1 ВОДА", 100), iStop = SmallButton("I0.2 СТОП", 188);
             iFoam.Click += delegate { Press(1); };
             iWater.Click += delegate { Press(2); };
             iStop.Click += delegate { Press(0); };
-            inputs.Controls.AddRange(new Control[] { iFoam, iWater, iStop });
+            machineOkBox.Text = "I0.3 Машината е во ред (аварија, заштита, вода)";
+            machineOkBox.Checked = true;
+            machineOkBox.SetBounds(12, 66, 262, 24);
+            machineOkBox.Font = new Font("Segoe UI", 8.5f);
+            machineOkBox.CheckedChanged += delegate { machineOk = machineOkBox.Checked; Scan(); };
+            inputs.Controls.AddRange(new Control[] { iFoam, iWater, iStop, machineOkBox });
 
-            GroupBox outputs = Group("Излези", x, 222, w, 104);
+            GroupBox outputs = Group("Излези", x, 250, w, 104);
             AddLamp(outputs, qFoam, "Q0.0  Пумпа ПЕНА", 26, Color.FromArgb(0xF9, 0xA8, 0x25));
             AddLamp(outputs, qWater, "Q0.1  Пумпа ВОДА", 50, Color.FromArgb(0x1E, 0x88, 0xE5));
             AddLamp(outputs, qEnable, "Картичка ОК (регистар 0)", 74, Brand.Good);
 
-            GroupBox sec = Group("Дигитален секундарник", x, 334, w, 112);
+            GroupBox sec = Group("Дигитален секундарник", x, 362, w, 112);
             display.SetBounds(12, 24, 256, 52);
             display.BackColor = Color.Black;
             display.ForeColor = Color.FromArgb(0xFF, 0x3D, 0x00);
@@ -285,12 +292,12 @@ namespace PeralnaAddons
             while (true)
             {
                 regs = modbus.ReadHolding(host, port, 0, RegCount);
-                if (regs != null) modbus.WriteSingle(host, port, 10, program);
+                if (regs != null && modbus.WriteSingle(host, port, 10, program)) modbus.WriteSingle(host, port, 11, machineOk ? 0 : 1);
                 Thread.Sleep(250);
             }
         }
 
-        bool MayRun(ushort[] r, bool commOk) { return commOk && r != null && r[0] == 1; }
+        bool MayRun(ushort[] r, bool commOk) { return commOk && machineOk && r != null && r[0] == 1; }
 
         void Press(int p)
         {
@@ -321,7 +328,7 @@ namespace PeralnaAddons
             linkText.ForeColor = commOk ? Brand.Good : Brand.Bad;
             hmiLamp.On = commOk;
 
-            int status = r == null ? -1 : r[4];
+            int status = !machineOk ? 9 : r == null ? -1 : r[4];
             int secondsLeft = r == null ? 0 : r[1];
             string name = "";
             if (r != null) for (int i = 0; i < Math.Min((int)r[NameLen], 32); i++) name += (char)r[NameStart + i];
@@ -331,7 +338,8 @@ namespace PeralnaAddons
             hmiInfo.Text = r != null && (enabled || name.Length > 0)
                 ? "Салдо: " + r[2] + " ден.   ·   Наплатено: " + r[3] + " ден.   ·   " + secondsLeft + " s"
                 : "";
-            string statusText = !commOk ? "Нема врска со компјутерот — излезите се исклучени"
+            string statusText = !machineOk ? Brand.StatusText(9) + " — излезите се исклучени"
+                : !commOk ? "Нема врска со компјутерот — излезите се исклучени"
                 : enabled ? (program == 1 ? "ПЕНА тече · се наплаќа" : program == 2 ? "ВОДА тече · се наплаќа" : "СТОП · не се наплаќа · избери ПЕНА или ВОДА")
                 : Brand.StatusText(status);
             hmiStatus.Text = statusText;
