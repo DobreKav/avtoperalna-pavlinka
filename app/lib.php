@@ -155,6 +155,11 @@ const PLC_MODELS = [
     'dvp12se' => 'Delta DVP12SE',
 ];
 const DELTA_D0 = 4096;
+// Highest first D register for the 53-register block. The block must stay below D300 (the
+// program's own work registers D300..D311) and below D408, where the DVP12SE's latched
+// registers start: a latched ENABLE = 1 would survive a power cut and let the bay run for
+// the 5 s until the watchdog trips, without the laptop.
+const DELTA_D_START_MAX = 247;
 
 const PLC_DEFAULTS = [
     'plc_model' => 's7-1200',
@@ -217,8 +222,9 @@ function save_plc_settings(array $in): array
         // Typed as the first D register (D0 by default); the block needs 53 registers (D0..D52).
         $d = trim((string)($in['plc_d_start'] ?? '0'));
         if ($d === '') $d = '0';
-        if (!ctype_digit($d) || (int)$d > 4095 - 52) {
-            $errors[] = 'Почетниот D регистар мора да е број од 0 до ' . (4095 - 52) . ' (стандардно 0, т.е. D0).';
+        if (!ctype_digit($d) || (int)$d > DELTA_D_START_MAX) {
+            $errors[] = 'Почетниот D регистар мора да е број од 0 до ' . DELTA_D_START_MAX . ' (стандардно 0, т.е. D0). '
+                . 'Повисоките D регистри се паметат при исклучување или се преклопуваат со D300–D311 во програмата.';
         } else {
             $v['plc_reg_base'] = (string)(DELTA_D0 + (int)$d);
         }
@@ -291,6 +297,25 @@ function check_csrf(): void
     }
 }
 
+// One-time form id for money forms: a double click on "Наполни" must not top a card up twice.
+// PHP holds the session file locked during a request, so the second click waits for the first
+// and then finds its id already used.
+function once_field(): string
+{
+    return '<input type="hidden" name="once" value="' . bin2hex(random_bytes(12)) . '">';
+}
+
+function form_already_sent(): bool
+{
+    $id = (string)($_POST['once'] ?? '');
+    if ($id === '') return false;   // a page opened before this update has no id
+    $used = $_SESSION['once_used'] ?? [];
+    if (in_array($id, $used, true)) return true;
+    $used[] = $id;
+    $_SESSION['once_used'] = array_slice($used, -50);
+    return false;
+}
+
 // ─── Ledger ─────────────────────────────────────────────────────
 
 class WalletError extends RuntimeException
@@ -327,7 +352,7 @@ function apply_transaction(int $cardId, string $type, int $amount, array $opts =
     if ($amount === 0) throw new WalletError('Износот не може да биде 0.');
     tx_begin();
     try {
-        $card = lock_card($cardId);
+        $card = load_card($cardId);
         $newBalance = (int)$card['balance'] + $amount;
         if ($newBalance < 0) {
             throw new WalletError('Нема доволно средства. Салдо: ' . money((int)$card['balance']), 'no_balance');
@@ -342,7 +367,7 @@ function apply_transaction(int $cardId, string $type, int $amount, array $opts =
     }
 }
 
-function lock_card(int $cardId): array
+function load_card(int $cardId): array
 {
     $stmt = db()->prepare('SELECT * FROM cards WHERE id = ?');
     $stmt->execute([$cardId]);
@@ -392,12 +417,21 @@ function find_machine(string $code): ?array
 // card goes down on every reader report; the ledger gets one row per session
 // when the card comes out.
 
+// The bay cannot keep spraying long after the agent's last report: the agent reports at least
+// every 15 s (tick_seconds, capped at 15) and retries a failed report after 2 s, it stops the
+// bay itself 20 s after the admin panel stopped answering, and the PLC watchdog stops the bay
+// 5 s after the agent goes silent. If the next report comes more than this many seconds after
+// the last one (agent restarted, admin panel hung, laptop clock jumped), the time after the last
+// report is not billed: the customer never pays for time the pump stood still.
+const MAX_UNREPORTED_SECONDS = 25;
+
 function seconds_left(int $balance, int $ratePerMinute): int
 {
     return $ratePerMinute > 0 ? intdiv($balance * 60, $ratePerMinute) : 0;
 }
 
-function lock_session(int $sessionId): array
+// Row loaders. They lock nothing themselves: the caller holds BEGIN IMMEDIATE (tx_begin).
+function load_session(int $sessionId): array
 {
     $stmt = db()->prepare('SELECT * FROM sessions WHERE id = ?');
     $stmt->execute([$sessionId]);
@@ -406,10 +440,7 @@ function lock_session(int $sessionId): array
     return $session;
 }
 
-/**
- * Charges everything owed up to $untilUtc. Must run inside a DB transaction
- * with the session and card rows locked. Returns [session, card, exhausted].
- */
+/** Seconds of foam or water in this session up to $untilUtc (finished stretches + the current one). */
 function active_seconds(array $session, string $untilUtc): int
 {
     $seconds = (int)$session['active_seconds'];
@@ -435,8 +466,29 @@ function set_active(array $session, bool $active, string $atUtc): array
     return $session;
 }
 
+/**
+ * The agent was silent for longer than the bay can run on its own: the running stretch ends at
+ * the last report and, if the bay still sprays, starts again at $untilUtc (the report that comes
+ * right after says whether it does). Runs inside the session's transaction.
+ */
+function skip_unreported_gap(array $session, string $untilUtc): array
+{
+    if ($session['active_since'] === null) return $session;
+    if (utc_ts($untilUtc) - utc_ts($session['last_seen_at']) <= MAX_UNREPORTED_SECONDS) return $session;
+    $session['active_seconds'] = active_seconds($session, $session['last_seen_at']);
+    $session['active_since'] = $untilUtc;
+    db()->prepare('UPDATE sessions SET active_seconds = ?, active_since = ? WHERE id = ?')
+        ->execute([$session['active_seconds'], $session['active_since'], $session['id']]);
+    return $session;
+}
+
+/**
+ * Charges everything owed up to $untilUtc. Must run inside a DB transaction (tx_begin).
+ * Returns [session, card, exhausted]; exhausted = the balance ran out.
+ */
 function accrue(array $session, array $card, string $untilUtc): array
 {
+    $session = skip_unreported_gap($session, $untilUtc);
     $elapsed = active_seconds($session, $untilUtc);
     $due = (int)ceil($elapsed * (int)$session['rate_per_minute'] / 60);
     $delta = max(0, $due - (int)$session['charged']);
@@ -494,6 +546,14 @@ function session_payload(array $session, array $card, bool $running): array
     ];
 }
 
+/** Is the session still running? The agent asks with every status report, so an admin stop reaches the bay within 2 s. */
+function session_is_running(int $sessionId): bool
+{
+    $stmt = db()->prepare('SELECT status FROM sessions WHERE id = ?');
+    $stmt->execute([$sessionId]);
+    return $stmt->fetchColumn() === 'running';
+}
+
 /** Closes sessions whose reader stopped reporting. Billing stops at the last report. */
 function close_stale_sessions(): void
 {
@@ -522,24 +582,31 @@ function begin_machine_session(string $machineCode, string $uid): array
 
     tx_begin();
     try {
-        $card = lock_card((int)$card['id']);
+        $card = load_card((int)$card['id']);
         $stmt = db()->prepare("SELECT * FROM sessions WHERE status = 'running' AND (machine_id = ? OR card_id = ?)");
         $stmt->execute([$machine['id'], $card['id']]);
         foreach ($stmt->fetchAll() as $open) {
             if ((int)$open['machine_id'] === (int)$machine['id'] && (int)$open['card_id'] === (int)$card['id']) {
-                // The reader restarted while the card stayed inside: carry on.
-                [$open, $card, $exhausted] = accrue($open, $card, utc_now());
+                // The agent restarted while the card stayed inside: carry on with the same session.
+                // While the agent was down the PLC watchdog stopped the bay, so billing ends at the
+                // agent's last report and the session goes on paused. The agent reports foam or
+                // water again within a second if the bay still runs.
+                $lastReport = $open['last_seen_at'];
+                [$open, $card, $exhausted] = accrue($open, $card, $lastReport);
                 if ($exhausted) {
                     $open = end_session($open, $card, 'no_balance', 'api');
                     tx_commit();
                     return session_payload($open, $card, false);
                 }
+                $open = set_active($open, false, $lastReport);
+                $open['last_seen_at'] = utc_now();
+                db()->prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ?')->execute([$open['last_seen_at'], $open['id']]);
                 tx_commit();
                 return session_payload($open, $card, true);
             }
             // A different card is in this reader now, or this card is still
             // booked on another machine: the old session is over.
-            $other = (int)$open['card_id'] === (int)$card['id'] ? $card : lock_card((int)$open['card_id']);
+            $other = (int)$open['card_id'] === (int)$card['id'] ? $card : load_card((int)$open['card_id']);
             [$open, $other] = accrue($open, $other, utc_now());
             end_session($open, $other, 'removed', 'api');
             if ((int)$other['id'] === (int)$card['id']) $card = $other;
@@ -562,7 +629,7 @@ function begin_machine_session(string $machineCode, string $uid): array
         db()->prepare(
             'INSERT INTO sessions (card_id, machine_id, rate_per_minute, started_at, last_seen_at) VALUES (?, ?, ?, ?, ?)'
         )->execute([$card['id'], $machine['id'], $machine['price_per_minute'], $now, $now]);
-        $session = lock_session((int)db()->lastInsertId());
+        $session = load_session((int)db()->lastInsertId());
         tx_commit();
         return session_payload($session, $card, true);
     } catch (Throwable $err) {
@@ -579,8 +646,8 @@ function tick_machine_session(int $sessionId, ?bool $active = null): array
 {
     tx_begin();
     try {
-        $session = lock_session($sessionId);
-        $card = lock_card((int)$session['card_id']);
+        $session = load_session($sessionId);
+        $card = load_card((int)$session['card_id']);
         if ($session['status'] !== 'running') {
             tx_commit();
             return session_payload($session, $card, false);
@@ -605,8 +672,8 @@ function finish_machine_session(int $sessionId, string $reason, string $source, 
 {
     tx_begin();
     try {
-        $session = lock_session($sessionId);
-        $card = lock_card((int)$session['card_id']);
+        $session = load_session($sessionId);
+        $card = load_card((int)$session['card_id']);
         if ($session['status'] === 'running') {
             $until = $reason === 'timeout' ? $session['last_seen_at'] : utc_now();
             [$session, $card] = accrue($session, $card, $until);

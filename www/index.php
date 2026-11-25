@@ -44,6 +44,8 @@ $readerOk = $statusFresh && $readerName !== '';
 $cardInside = $statusFresh && setting('card_present') === '1';
 $plcOk = $statusFresh && setting('plc_ok') === '1';
 $plcPeer = (string)setting('plc_peer');
+$plcFault = $plcOk && setting('plc_fault') === '1';
+$plcModel = PLC_MODELS[(string)setting('plc_model')] ?? PLC_MODELS[PLC_DEFAULTS['plc_model']];
 $unknownUid = setting('last_unknown_uid');
 $unknownAt = setting('last_unknown_at');
 $showUnknown = $unknownUid && $unknownAt && time() - utc_ts($unknownAt) < 3600 && !find_card_by_uid($unknownUid);
@@ -71,7 +73,8 @@ page_header('Машини', $user, true);
   </div>
   <div class="link-status <?= $plcOk ? 'on' : 'off' ?>">
     <i></i>
-    <div><b>PLC (S7-1200)</b><small><?= !$statusFresh ? 'Непознато (агентот не се јавува)' : ($plcOk ? 'Поврзан · ' . e($plcPeer) : 'Не е поврзан') ?></small>
+    <div><b>PLC (<?= e($plcModel) ?>)</b><small><?= !$statusFresh ? 'Непознато (агентот не се јавува)' : ($plcOk ? 'Поврзан · ' . e($plcPeer) : 'Не е поврзан') ?></small>
+      <?php if ($plcFault): ?><small class="plc-error">⚠ Машината не е во ред (аварија, заштита на пумпата или вода): пената и водата се исклучени, не се наплаќа.</small><?php endif; ?>
       <?php $plcError = (string)setting('plc_error'); if ($statusFresh && !$plcOk && $plcError !== ''): ?><small class="plc-error"><?= e($plcError) ?></small><?php endif; ?>
       <small><a href="plc.php">Поставки за IP и порта →</a></small></div>
   </div>

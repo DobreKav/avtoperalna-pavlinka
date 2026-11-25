@@ -19,7 +19,9 @@
 //   6  minutes left
 //   10 program         written by the PLC (FC6/FC16): 0 stop, 1 foam, 2 water. The card is billed
 //                      only while this is 1 or 2, so СТОП on the bay stops the money running out.
-//   11-19              free for the PLC to write
+//   11 fault           written by the PLC: 1 = the machine is not OK (E-stop, motor protection or
+//                      water level opened its "machine OK" input). No billing, status 9 on the display.
+//   12-19              free for the PLC to write
 //   20 name length     card holder name for the touch panel, in characters (max 32)
 //   21-52 name         one UTF-16 character per register (Cyrillic works; WString on the PLC)
 using System;
@@ -48,6 +50,28 @@ namespace Peralna
         ServerError = 6,
         NoReader = 7,
         ReadError = 8,
+        MachineFault = 9,  // the PLC reports the machine is not OK (register 11)
+    }
+
+    // Register numbers of the map above (0-based holding registers).
+    static class Reg
+    {
+        public const int Enable = 0, SecondsLeft = 1, Balance = 2, Charged = 3, Status = 4, Heartbeat = 5, MinutesLeft = 6;
+        public const int LaptopCount = 10;               // 0..9 are written by the laptop
+        public const int Program = 10, Fault = 11;       // written by the PLC
+        public const int PlcFirst = 10, PlcCount = 10;   // 10..19 belong to the PLC
+        public const int NameLength = 20, NameStart = 21, NameMax = 32;
+        public const int NameBlockCount = 1 + NameMax;   // 20..52
+        public const int Total = 100;                    // size of the table on the laptop
+    }
+
+    // Seconds since the agent started, from a monotonic clock. Unlike DateTime.Now it does not jump
+    // when Windows changes to or from summer time or corrects the clock, so the timers below
+    // (heartbeat, reports, countdown) keep running through the night of the time change.
+    static class Clock
+    {
+        static readonly Stopwatch Watch = Stopwatch.StartNew();
+        public static double Now { get { return Watch.Elapsed.TotalSeconds; } }
     }
 
     class Config
@@ -57,8 +81,12 @@ namespace Peralna
         public string ApiKey = "";
         public int ModbusPort = 502;
         public string Reader = "";
+        // Report to the admin panel at least this often while a card is inside (5..15 s), and stop
+        // the bay if it has not answered for OfflineStopSeconds (10..20 s). The billing server
+        // relies on both limits: it bills nothing after a report gap of more than 25 s
+        // (MAX_UNREPORTED_SECONDS in app/lib.php).
         public int TickSeconds = 15;
-        public int OfflineStopSeconds = 45;
+        public int OfflineStopSeconds = 20;
         public bool Simulate = false;
         public int WebPort = 8080;          // 0 = do not start the built-in web server (e.g. under XAMPP)
         public string WebBind = "127.0.0.1";
@@ -90,11 +118,11 @@ namespace Peralna
                     case "plc_ip": c.Plc.PlcIp = val; break;
                     case "plc_port": c.Plc.PlcPort = int.Parse(val); break;
                     case "plc_model":
-                        if (val.ToLowerInvariant() == "dvp12se") { c.Plc.Model = "dvp12se"; c.Plc.Mode = "client"; c.Plc.RegBase = 4096; }
+                        if (val.ToLowerInvariant() == "dvp12se") { c.Plc.Model = "dvp12se"; c.Plc.Mode = "client"; c.Plc.RegBase = PlcSettings.DeltaD0; }
                         break;
                     case "reader": c.Reader = val; break;
-                    case "tick_seconds": c.TickSeconds = Math.Max(5, int.Parse(val)); break;
-                    case "offline_stop_seconds": c.OfflineStopSeconds = Math.Max(10, int.Parse(val)); break;
+                    case "tick_seconds": c.TickSeconds = Math.Min(15, Math.Max(5, int.Parse(val))); break;
+                    case "offline_stop_seconds": c.OfflineStopSeconds = Math.Min(20, Math.Max(10, int.Parse(val))); break;
                     case "web_port": c.WebPort = int.Parse(val); break;
                     case "web_bind": c.WebBind = val; break;
                     case "virtual_reader_port": c.VirtualReaderPort = int.Parse(val); break;
@@ -137,6 +165,11 @@ namespace Peralna
         public string Model = "s7-1200";     // "s7-1200" or "dvp12se" (Delta, always client mode here)
         public int RegBase = 0;              // Modbus address of register 0 (Delta: 4096 = D0)
 
+        // Delta D0 sits at Modbus 4096. The first D register of the block may be 0..247, as in
+        // app/lib.php (DELTA_D_START_MAX): the block must stay below D300 (the program's work
+        // registers) and below D408, where the latched registers start.
+        public const int DeltaD0 = 4096, DeltaDStartMax = 247;
+
         public bool IsDelta { get { return Model == "dvp12se"; } }
 
         public string Key()
@@ -153,7 +186,7 @@ namespace Peralna
         public string Describe()
         {
             if (IsDelta)
-                return "Лаптоп → Delta DVP12SE " + PlcIp + ":" + PlcPort + " (D" + (RegBase - 4096) + "–D" + (RegBase - 4096 + 52) + ")";
+                return "Лаптоп → Delta DVP12SE " + PlcIp + ":" + PlcPort + " (D" + (RegBase - DeltaD0) + "–D" + (RegBase - DeltaD0 + 52) + ")";
             return Mode == "client"
                 ? "Лаптоп → PLC " + PlcIp + ":" + PlcPort
                 : "Лаптопот слуша на " + ListenIp + ":" + ListenPort + (AllowedIp.Length > 0 ? " (само " + AllowedIp + ")" : "");
@@ -198,7 +231,7 @@ namespace Peralna
             if (p.IsDelta)
             {
                 p.Mode = "client";   // the DVP12SE is the Modbus TCP server on its Ethernet port
-                if (p.RegBase < 4096 || p.RegBase > 4096 + 4095 - 52) p.RegBase = 4096;
+                if (p.RegBase < DeltaD0 || p.RegBase > DeltaD0 + DeltaDStartMax) p.RegBase = DeltaD0;
             }
             else p.RegBase = 0;
             return p;
@@ -218,7 +251,7 @@ namespace Peralna
 
     class Registers
     {
-        readonly ushort[] regs = new ushort[100];
+        readonly ushort[] regs = new ushort[Reg.Total];
         readonly object gate = new object();
 
         public ushort Get(int i) { lock (gate) return regs[i]; }
@@ -235,7 +268,7 @@ namespace Peralna
             }
         }
 
-        public bool WritableByPlc(int start, int count) { return start >= 10 && start + count <= 20; }
+        public bool WritableByPlc(int start, int count) { return start >= Reg.PlcFirst && start + count <= Reg.PlcFirst + Reg.PlcCount; }
     }
 
     // ─── Modbus TCP framing shared by the server and the client ──
@@ -408,10 +441,10 @@ namespace Peralna
                 case 1: // read coils: coil 0 mirrors register 0 (enable)
                 case 2:
                 {
-                    if (qty < 1 || qty > 2000 || addr + qty > 100) return Fail(fc, 2);
+                    if (qty < 1 || qty > 2000 || addr + qty > Reg.Total) return Fail(fc, 2);
                     byte[] bits = new byte[(qty + 7) / 8];
                     for (int i = 0; i < qty; i++)
-                        if (regs.Get(addr + i) != 0 && addr + i == 0) bits[i / 8] |= (byte)(1 << (i % 8));
+                        if (addr + i == Reg.Enable && regs.Get(Reg.Enable) != 0) bits[i / 8] |= (byte)(1 << (i % 8));
                     byte[] r = new byte[2 + bits.Length];
                     r[0] = fc; r[1] = (byte)bits.Length;
                     Array.Copy(bits, 0, r, 2, bits.Length);
@@ -420,7 +453,7 @@ namespace Peralna
                 case 3:
                 case 4:
                 {
-                    if (qty < 1 || qty > 125 || addr + qty > 100) return Fail(fc, 2);
+                    if (qty < 1 || qty > 125 || addr + qty > Reg.Total) return Fail(fc, 2);
                     ushort[] v = regs.Snapshot(addr, qty);
                     byte[] r = new byte[2 + qty * 2];
                     r[0] = fc; r[1] = (byte)(qty * 2);
@@ -449,7 +482,7 @@ namespace Peralna
     //
     // Every PollMs: write registers 0..9 and 20..52 to the PLC (FC16), then read 10..19 back
     // (FC3). Registers 10..19 belong to the PLC and are never written from here, so the
-    // program the bay chose (register 10) cannot be overwritten.
+    // program the bay chose (register 10) and its fault flag (11) cannot be overwritten.
 
     class ModbusClient : IPlcLink
     {
@@ -541,17 +574,18 @@ namespace Peralna
 
         void Exchange(NetworkStream s)
         {
-            ushort[] head = regs.Snapshot(0, 10);
+            ushort[] head = regs.Snapshot(0, Reg.LaptopCount);
             if (cfg.IsDelta)
             {
                 // Delta D registers are signed 16-bit: keep the numbers positive on the HMI.
-                // The heartbeat (5) may wrap, the PLC only compares it for a change.
-                foreach (int i in new[] { 1, 2, 3, 6 }) if (head[i] > 32767) head[i] = 32767;
+                // The heartbeat may wrap, the PLC only compares it for a change.
+                foreach (int i in new[] { Reg.SecondsLeft, Reg.Balance, Reg.Charged, Reg.MinutesLeft })
+                    if (head[i] > 32767) head[i] = 32767;
             }
             WriteBlock(s, cfg.RegBase, head);
-            WriteBlock(s, cfg.RegBase + 20, regs.Snapshot(20, 33));
-            ushort[] back = ReadBlock(s, cfg.RegBase + 10, 10);
-            for (int i = 0; i < back.Length; i++) regs.Set(10 + i, back[i]);
+            WriteBlock(s, cfg.RegBase + Reg.NameLength, regs.Snapshot(Reg.NameLength, Reg.NameBlockCount));
+            ushort[] back = ReadBlock(s, cfg.RegBase + Reg.PlcFirst, Reg.PlcCount);
+            for (int i = 0; i < back.Length; i++) regs.Set(Reg.PlcFirst + i, back[i]);
         }
 
         byte[] Request(NetworkStream s, byte[] pdu)
@@ -863,10 +897,14 @@ namespace Peralna
 
         class TimedClient : WebClient
         {
+            // The admin panel runs on this laptop and answers in milliseconds. 3 s keeps one stuck
+            // call from holding up the main loop (card removal, countdown) for long.
             protected override WebRequest GetWebRequest(Uri address)
             {
                 WebRequest r = base.GetWebRequest(address);
-                r.Timeout = 5000;
+                r.Timeout = 3000;
+                HttpWebRequest http = r as HttpWebRequest;
+                if (http != null) http.ReadWriteTimeout = 3000;
                 return r;
             }
         }
@@ -912,21 +950,63 @@ namespace Peralna
         string reader;
         bool cardPresent;
         int sessionId;
-        int secondsLeft;
-        DateTime lastTick = DateTime.MinValue;
-        DateTime lastServerOk = DateTime.Now;
-        DateTime lastSecond = DateTime.Now;
-        DateTime lastStatus = DateTime.MinValue;
+        double secondsLeft;          // what the balance still buys; counted down locally between reports
+        // Timers, in Clock.Now seconds (monotonic).
+        double lastTick = double.MinValue;
+        double lastServerOk = Clock.Now;
+        double lastSecond = Clock.Now;
+        double lastStatus = double.MinValue;
+        bool tickNow;                // report at once (the admin panel says the session has ended)
+        double retryAt;              // after a report that failed, the next try waits until then
         readonly List<int> pendingStops = new List<int>();
         readonly Queue<string> commands = new Queue<string>();
         string simulatedUid;
         bool simActive;     // the card came from the virtual reader (CardEmulator.exe)
         bool spraying;      // last state sent to the server: foam or water on
+        Status cardStatus = Status.NoReader;   // the card side's status; a machine fault overrides it on the display
+        bool faultLogged;
         readonly VirtualReader virtualReader = new VirtualReader();
         PlcSettings plc;
         IPlcLink link;
 
         public Agent(Config cfg) { this.cfg = cfg; api = new Api(cfg); }
+
+        // ── Heartbeat for the PLC watchdog (register 5, +1 every second) ──
+        // It has its own thread, so a slow admin panel cannot make the PLC stop the bay in the
+        // middle of a wash. It beats only while the main loop keeps coming round (MarkAlive): if the
+        // agent hangs for HangSeconds the beat stops and the PLC stops the bay 5 s later. If the
+        // agent is closed or crashes, or the laptop freezes, the beat stops at once.
+        const double HangSeconds = 8;
+        long aliveBits;
+
+        void MarkAlive() { Interlocked.Exchange(ref aliveBits, BitConverter.DoubleToInt64Bits(Clock.Now)); }
+
+        void StartHeartbeat()
+        {
+            MarkAlive();
+            Thread t = new Thread(delegate ()
+            {
+                while (true)
+                {
+                    Thread.Sleep(1000);
+                    double alive = BitConverter.Int64BitsToDouble(Interlocked.Read(ref aliveBits));
+                    if (Clock.Now - alive < HangSeconds) regs.Bump(Reg.Heartbeat);
+                }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        // Every call to the admin panel goes through here: when it returns, the main loop is alive.
+        Dictionary<string, object> Call(string action, NameValueCollection fields)
+        {
+            Dictionary<string, object> r = api.Call(action, fields);
+            MarkAlive();
+            return r;
+        }
+
+        // The PLC reports in register 11 that the machine is not OK (E-stop, motor protection, water).
+        bool MachineFault { get { return link.Connected && regs.Get(Reg.Fault) != 0; } }
 
         // Starts the PLC link, or swaps it when the settings on the admin panel change.
         void ApplyPlc(PlcSettings next)
@@ -988,35 +1068,45 @@ namespace Peralna
 
         void Show(Status status, bool enable)
         {
-            regs.Set(0, enable ? 1 : 0);
-            regs.Set(4, (int)status);
+            cardStatus = status;
+            regs.Set(Reg.Enable, enable ? 1 : 0);
+            PublishStatus();
+        }
+
+        void PublishStatus()
+        {
+            regs.Set(Reg.Status, (int)(MachineFault ? Status.MachineFault : cardStatus));
+        }
+
+        void SetSecondsLeft(double seconds)
+        {
+            secondsLeft = Math.Max(0, seconds);
+            regs.Set(Reg.SecondsLeft, (int)secondsLeft);
+            regs.Set(Reg.MinutesLeft, (int)secondsLeft / 60);
         }
 
         void Apply(Dictionary<string, object> r)
         {
-            regs.Set(2, Int(r, "balance"));
-            regs.Set(3, Int(r, "charged"));
-            secondsLeft = Int(r, "seconds_left");
-            regs.Set(1, secondsLeft);
-            regs.Set(6, secondsLeft / 60);
+            regs.Set(Reg.Balance, Int(r, "balance"));
+            regs.Set(Reg.Charged, Int(r, "charged"));
+            SetSecondsLeft(Int(r, "seconds_left"));
             object name;
             if (r != null && r.TryGetValue("holder_name", out name) && name != null) SetName(name.ToString());
         }
 
-        const int NameLength = 20, NameStart = 21, NameMax = 32;
-
         void SetName(string name)
         {
-            if (name.Length > NameMax) name = name.Substring(0, NameMax);
-            for (int i = 0; i < NameMax; i++) regs.Set(NameStart + i, i < name.Length ? name[i] : 0);
-            regs.Set(NameLength, name.Length);
+            if (name.Length > Reg.NameMax) name = name.Substring(0, Reg.NameMax);
+            for (int i = 0; i < Reg.NameMax; i++) regs.Set(Reg.NameStart + i, i < name.Length ? name[i] : 0);
+            regs.Set(Reg.NameLength, name.Length);
         }
 
         public void Run()
         {
             ApplyPlc(cfg.Plc.Clone());       // from agent.ini until the admin panel answers
             Show(Status.NoReader, false);
-            Dictionary<string, object> ping = api.Call("ping", new NameValueCollection());
+            StartHeartbeat();
+            Dictionary<string, object> ping = Call("ping", new NameValueCollection());
             Log.Write(ping != null && Bool(ping, "ok") ? "Billing server OK: " + cfg.Server : "Billing server NOT reachable: " + cfg.Server);
             SendStatus();                    // picks up the PLC settings from the admin panel
 
@@ -1035,6 +1125,7 @@ namespace Peralna
 
             while (true)
             {
+                MarkAlive();
                 try { if (cfg.Simulate) SimulatedStep(); else Step(); }
                 catch (Exception ex) { Log.Write("Error: " + ex.Message); Thread.Sleep(1000); }
             }
@@ -1047,7 +1138,7 @@ namespace Peralna
             if (simActive) { Thread.Sleep(200); EverySecond(); return; }
             if (!EnsureReader())
             {
-                if (virtualReader.Connected && !cardPresent && regs.Get(4) == (int)Status.NoReader) Show(Status.Idle, false);
+                if (virtualReader.Connected && !cardPresent && cardStatus == Status.NoReader) Show(Status.Idle, false);
                 Thread.Sleep(virtualReader.Connected ? 200 : 1000);
                 EverySecond();
                 return;
@@ -1167,17 +1258,17 @@ namespace Peralna
             NameValueCollection f = new NameValueCollection();
             f["machine"] = cfg.Machine;
             f["uid"] = uid;
-            Dictionary<string, object> r = api.Call("start", f);
+            Dictionary<string, object> r = Call("start", f);
             if (r == null) { Show(Status.ServerError, false); return; }
-            lastServerOk = DateTime.Now;
+            lastServerOk = Clock.Now;
             Apply(r);
             if (Bool(r, "running"))
             {
                 sessionId = Int(r, "session_id");
                 spraying = Bool(r, "active");
-                lastTick = DateTime.Now;
+                lastTick = Clock.Now;
                 Show(Status.Running, true);
-                Log.Write("Machine ON  session " + sessionId + ", balance " + Int(r, "balance") + ", ~" + (secondsLeft / 60) + " min");
+                Log.Write("Machine ON  session " + sessionId + ", balance " + Int(r, "balance") + ", ~" + ((int)secondsLeft / 60) + " min");
                 return;
             }
             string reason = Str(r, "reason");
@@ -1193,9 +1284,7 @@ namespace Peralna
         void CardRemoved()
         {
             Show(Status.Idle, false);   // stop the machine first, then settle the bill
-            secondsLeft = 0;
-            regs.Set(1, 0);
-            regs.Set(6, 0);
+            SetSecondsLeft(0);
             SetName("");
             spraying = false;
             Log.Write("Card out");
@@ -1213,19 +1302,21 @@ namespace Peralna
             {
                 NameValueCollection f = new NameValueCollection();
                 f["session_id"] = pendingStops[i].ToString();
-                Dictionary<string, object> r = api.Call("stop", f);
+                Dictionary<string, object> r = Call("stop", f);
                 if (r == null) continue; // retried every second; the server also times it out
                 Log.Write("Session " + pendingStops[i] + " closed, charged " + Int(r, "charged") + ", balance " + Int(r, "balance"));
-                if (!cardPresent) { regs.Set(2, Int(r, "balance")); regs.Set(3, Int(r, "charged")); }
+                if (!cardPresent) { regs.Set(Reg.Balance, Int(r, "balance")); regs.Set(Reg.Charged, Int(r, "charged")); }
                 pendingStops.RemoveAt(i);
             }
         }
 
         void SendStatus()
         {
-            lastStatus = DateTime.Now;
+            lastStatus = Clock.Now;
             NameValueCollection f = new NameValueCollection();
             f["machine"] = cfg.Machine;
+            f["session_id"] = sessionId.ToString();   // the reply says if an admin ended it
+            f["plc_fault"] = MachineFault ? "1" : "0";
             string readerName = cfg.Simulate ? "SIMULATION" : (reader ?? "");
             if (virtualReader.Connected)
                 readerName = readerName.Length > 0 ? readerName + " + виртуелен" : "Виртуелен читач (" + virtualReader.Name + ")";
@@ -1246,56 +1337,74 @@ namespace Peralna
             f["cur_plc_ip"] = plc.PlcIp;
             f["cur_plc_port"] = plc.PlcPort.ToString();
             f["cur_model"] = plc.Model;
-            Dictionary<string, object> r = api.Call("status", f);
+            Dictionary<string, object> r = Call("status", f);
             object conf;
             if (r != null && r.TryGetValue("config", out conf) && conf is Dictionary<string, object>)
                 ApplyPlc(PlcSettings.FromServer((Dictionary<string, object>)conf, plc));
+            object running;
+            if (sessionId != 0 && r != null && r.TryGetValue("session_running", out running) && running is bool && !(bool)running)
+                tickNow = true;   // ended on the admin panel: the tick right after stops the bay
         }
 
         void EverySecond()
         {
-            if ((DateTime.Now - lastSecond).TotalSeconds < 1) return;
-            lastSecond = DateTime.Now;
-            regs.Bump(5);
+            double now = Clock.Now;
+            double passed = now - lastSecond;
+            if (passed < 1) return;
+            lastSecond = now;
+
+            bool fault = MachineFault;
+            if (fault != faultLogged)
+            {
+                faultLogged = fault;
+                Log.Write(fault ? "PLC: machine NOT OK (E-stop, motor protection or water): foam and water off, no billing"
+                                : "PLC: machine OK again");
+            }
+            PublishStatus();
             if (virtualReader.Connected)
             {
                 StringBuilder name = new StringBuilder();
-                for (int i = 0; i < regs.Get(NameLength); i++) name.Append((char)regs.Get(NameStart + i));
-                virtualReader.Send("STATE " + regs.Get(4) + "|" + regs.Get(0) + "|" + regs.Get(2) + "|" + regs.Get(1) + "|" + regs.Get(3) + "|" + name);
+                for (int i = 0; i < regs.Get(Reg.NameLength); i++) name.Append((char)regs.Get(Reg.NameStart + i));
+                virtualReader.Send("STATE " + regs.Get(Reg.Status) + "|" + regs.Get(Reg.Enable) + "|" + regs.Get(Reg.Balance)
+                    + "|" + regs.Get(Reg.SecondsLeft) + "|" + regs.Get(Reg.Charged) + "|" + name);
             }
-            if ((DateTime.Now - lastStatus).TotalSeconds >= 2) SendStatus();
+            if (now - lastStatus >= 2) SendStatus();
             if (pendingStops.Count > 0) FlushStops();
             if (sessionId == 0) return;
 
+            // The admin panel has not answered for too long: stop the bay now, even between reports.
+            // It may run again once the panel answers (the customer presses ПЕНА or ВОДА again).
+            if (regs.Get(Reg.Enable) == 1 && now - lastServerOk > cfg.OfflineStopSeconds)
+            {
+                Show(Status.ServerError, false);
+                Log.Write("Server offline too long: machine OFF");
+            }
+
             // Foam or water is on: the PLC writes its program to register 10. A stale value from a
-            // PLC that has gone away does not count.
-            bool nowSpraying = regs.Get(0) == 1 && regs.Get(10) != 0 && link.Connected;
+            // PLC that has gone away, or a machine fault, does not count.
+            bool nowSpraying = regs.Get(Reg.Enable) == 1 && regs.Get(Reg.Program) != 0 && !fault && link.Connected;
             bool changed = nowSpraying != spraying;
             if (nowSpraying)
             {
-                secondsLeft = Math.Max(0, secondsLeft - 1);
-                regs.Set(1, secondsLeft);
-                regs.Set(6, secondsLeft / 60);
-                if (secondsLeft == 0) regs.Set(0, 0); // out of money by our own count: stop now, the server confirms
+                // Count down by the real time that passed, so a slow pass of the loop gives no free seconds.
+                SetSecondsLeft(secondsLeft - passed);
+                if (secondsLeft <= 0) regs.Set(Reg.Enable, 0); // out of money by our own count: stop now, the server confirms
             }
-            bool due = changed || (DateTime.Now - lastTick).TotalSeconds >= cfg.TickSeconds || (nowSpraying && secondsLeft == 0);
-            if (!due) return;
+            bool due = changed || tickNow || now - lastTick >= cfg.TickSeconds || (nowSpraying && secondsLeft <= 0);
+            if (!due || now < retryAt) return;
 
-            lastTick = DateTime.Now;
+            lastTick = now;
+            tickNow = false;
             NameValueCollection f = new NameValueCollection();
             f["session_id"] = sessionId.ToString();
             f["active"] = nowSpraying ? "1" : "0";
-            Dictionary<string, object> r = api.Call("tick", f);
+            Dictionary<string, object> r = Call("tick", f);
             if (r == null)
             {
-                if ((DateTime.Now - lastServerOk).TotalSeconds > cfg.OfflineStopSeconds)
-                {
-                    Show(Status.ServerError, false);
-                    Log.Write("Server offline too long: machine OFF");
-                }
+                retryAt = Clock.Now + 2;   // the admin panel did not answer: try again in 2 s
                 return;
             }
-            lastServerOk = DateTime.Now;
+            lastServerOk = Clock.Now;
             if (changed) Log.Write(nowSpraying ? "Spraying: billing runs" : "STOP: billing paused");
             spraying = nowSpraying;
             Apply(r);

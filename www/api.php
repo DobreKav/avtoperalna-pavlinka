@@ -4,7 +4,8 @@
 //   POST action=tick   session_id=12
 //   POST action=stop   session_id=12
 //   GET  action=ping
-//   POST action=status  (every 2 s; the reply carries the PLC link settings from plc.php)
+//   POST action=status  (every 2 s; the reply carries the PLC link settings from plc.php and
+//                        whether the agent's session is still running)
 // With an empty api_key in config.php only this computer may call it.
 declare(strict_types=1);
 require dirname(__DIR__) . '/app/lib.php';
@@ -41,11 +42,13 @@ try {
             close_stale_sessions();
             reply(['ok' => true, 'time' => utc_now()]);
         case 'status':
-            // Reader and PLC link, reported by the agent every 5 s.
+            // Reader and PLC link, reported by the agent every 2 s.
             setting('status_at', utc_now());
             setting('reader_name', mb_substr((string)($input['reader'] ?? ''), 0, 200));
             setting('card_present', ($input['card'] ?? '') === '1' ? '1' : '0');
             setting('plc_ok', ($input['plc'] ?? '') === '1' ? '1' : '0');
+            // The PLC's "machine OK" input is off (E-stop, motor protection, water).
+            setting('plc_fault', ($input['plc_fault'] ?? '') === '1' ? '1' : '0');
             setting('plc_peer', mb_substr(preg_replace('/[^0-9a-fA-F.:]/', '', (string)($input['plc_peer'] ?? '')) ?? '', 0, 45));
             // What the agent is actually doing with the PLC link, for plc.php.
             setting('plc_link', mb_substr((string)($input['plc_link'] ?? ''), 0, 120));
@@ -69,7 +72,11 @@ try {
                 ]);
             }
             // The reply carries the PLC settings: the agent applies changes within seconds.
-            reply(['ok' => true, 'config' => plc_settings()]);
+            $status = ['ok' => true, 'config' => plc_settings()];
+            // An admin may have ended the session on the dashboard: the agent then stops the bay.
+            $sessionId = (int)($input['session_id'] ?? 0);
+            if ($sessionId > 0) $status['session_running'] = session_is_running($sessionId);
+            reply($status);
         case 'start':
             reply(begin_machine_session((string)($input['machine'] ?? ''), (string)($input['uid'] ?? '')));
         case 'tick':

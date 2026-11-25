@@ -22,14 +22,19 @@ function check(string $label, $actual, $expected): void
     }
 }
 
-// Pretend the session began $seconds ago (and was last seen $seenAgo ago).
-function age_session(int $id, int $seconds, ?int $seenAgo = null): void
+function ago(int $seconds): string
 {
-    // Spraying (foam or water) the whole time since the start.
+    return gmdate('Y-m-d H:i:s', time() - $seconds);
+}
+
+// Pretend the session began $seconds ago, spraying (foam or water) the whole time, and the
+// agent last reported $seenAgo seconds ago (0 = it has been reporting all along).
+function age_session(int $id, int $seconds, int $seenAgo = 0): void
+{
     db()->prepare('UPDATE sessions SET started_at = ?, active_since = ?, active_seconds = 0, last_seen_at = ? WHERE id = ?')->execute([
-        gmdate('Y-m-d H:i:s', time() - $seconds),
-        gmdate('Y-m-d H:i:s', time() - $seconds),
-        gmdate('Y-m-d H:i:s', time() - ($seenAgo ?? $seconds)),
+        ago($seconds),
+        ago($seconds),
+        ago($seenAgo),
         $id,
     ]);
 }
@@ -127,6 +132,46 @@ check('still 10 den while paused', $t['charged'], 10);
 $done = finish_machine_session($p['session_id'], 'removed', 'api');
 check('card out after the pause: 10 den in total', $done['charged'], 10);
 
+// Gaps in the agent's reports. The PLC watchdog and the agent stop the bay by themselves
+// within ~21 s, so a longer gap is not billed (MAX_UNREPORTED_SECONDS = 25). W2 = 5 den/min.
+$g = begin_machine_session('W2', '04A1B2C3');
+tick_machine_session($g['session_id'], true);
+db()->prepare('UPDATE sessions SET active_since = ?, last_seen_at = ? WHERE id = ?')->execute([ago(610), ago(600), $g['session_id']]);
+$t = tick_machine_session($g['session_id'], false);   // admin panel was down 10 min, now answers again
+check('10 min without reports: only the 10 s up to the last report are billed', [$t['charged'], $t['active']], [1, false]);
+finish_machine_session($g['session_id'], 'removed', 'api');
+
+$g = begin_machine_session('W2', '04A1B2C3');
+tick_machine_session($g['session_id'], true);
+db()->prepare('UPDATE sessions SET active_since = ?, last_seen_at = ? WHERE id = ?')->execute([ago(60), ago(24), $g['session_id']]);
+$t = tick_machine_session($g['session_id'], true);
+check('a 24 s gap (a retried report) is billed in full: 60 s = 5 den', [$t['charged'], $t['active']], [5, true]);
+finish_machine_session($g['session_id'], 'removed', 'api');
+
+$g = begin_machine_session('W2', '04A1B2C3');
+tick_machine_session($g['session_id'], true);
+db()->prepare('UPDATE sessions SET active_since = ?, last_seen_at = ? WHERE id = ?')->execute([ago(40), ago(26), $g['session_id']]);
+$t = tick_machine_session($g['session_id'], true);
+check('a 26 s gap: only the 14 s up to the last report (2 den)', [$t['charged'], $t['active']], [2, true]);
+db()->prepare('UPDATE sessions SET active_since = ? WHERE id = ?')->execute([ago(60), $g['session_id']]);
+$t = tick_machine_session($g['session_id'], false);
+check('after the gap the spray is billed again: 14 s + 60 s = 7 den', $t['charged'], 7);
+finish_machine_session($g['session_id'], 'removed', 'api');
+
+// Agent restarted while the card stayed in (90 s after its last report, under the 120 s timeout):
+// the PLC stopped the bay meanwhile, so billing ends at the last report and the session goes on paused.
+$g = begin_machine_session('W2', '04A1B2C3');
+tick_machine_session($g['session_id'], true);
+db()->prepare('UPDATE sessions SET active_since = ?, last_seen_at = ? WHERE id = ?')->execute([ago(95), ago(90), $g['session_id']]);
+$r = begin_machine_session('W2', '04A1B2C3');
+check('agent restart resumes the same session', $r['session_id'], $g['session_id']);
+check('agent restart: only the 5 s up to the last report (1 den), paused', [$r['charged'], $r['active'], $r['running']], [1, false, true]);
+$t = tick_machine_session($g['session_id'], false);
+check('agent restart: nothing more for the downtime', $t['charged'], 1);
+check('the agent sees a running session', session_is_running($g['session_id']), true);
+finish_machine_session($g['session_id'], 'admin', 'admin');
+check('the agent sees an admin stop', session_is_running($g['session_id']), false);
+
 // Demo card: exists after setup and refills itself when low.
 $demo = find_card_by_uid(DEMO_UID);
 check('demo card exists', $demo !== null && $demo['holder_name'] === 'Демо картичка', true);
@@ -156,6 +201,22 @@ check('refused input changes nothing', plc_settings()['plc_ip'], '192.168.0.50')
 check('server mode with an allowed PLC', save_plc_settings(['plc_mode' => 'server', 'plc_listen_ip' => '', 'plc_listen_port' => '5020', 'plc_allowed_ip' => '192.168.1.20']), []);
 check('empty listen IP means all', [plc_settings()['plc_listen_ip'], plc_settings()['plc_allowed_ip'], plc_settings()['test_mode']], ['0.0.0.0', '192.168.1.20', '0']);
 check('test mode off again after save without it', test_mode(), false);
+$delta = ['plc_model' => 'dvp12se', 'plc_ip' => '192.168.1.20', 'plc_port' => '502', 'plc_unit_id' => '1', 'plc_poll_ms' => '200'];
+check('Delta first D register 247 allowed', save_plc_settings($delta + ['plc_d_start' => '247']), []);
+check('Delta D247 = Modbus 4343', plc_settings()['plc_reg_base'], '4343');
+check('Delta first D register 248 refused (block would reach D300)', count(save_plc_settings($delta + ['plc_d_start' => '248'])), 1);
+check('Delta first D register 400 refused (latched area)', count(save_plc_settings($delta + ['plc_d_start' => '400'])), 1);
+check('refused D register changes nothing', plc_settings()['plc_reg_base'], '4343');
+
+// Top-up form sent twice (double click).
+$_SESSION = [];
+$_POST = ['once' => 'form-1'];
+check('first submit of a money form goes through', form_already_sent(), false);
+check('second submit of the same form is ignored', form_already_sent(), true);
+$_POST = ['once' => 'form-2'];
+check('the next form goes through', form_already_sent(), false);
+$_POST = [];
+check('a page opened before the update (no id) still works', form_already_sent(), false);
 
 foreach (glob($dbFile . '*') as $f) @unlink($f);
 echo $failures ? "\n$failures FAILED\n" : "\nALL PASSED\n";
